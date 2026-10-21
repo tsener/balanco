@@ -49,6 +49,7 @@ pub struct Weights {
 pub struct Config {
     pub management: Endpoint,
     pub model: Endpoint,
+    pub model_id: Option<String>,
     pub policies: BTreeMap<String, Policy>,
     pub interval_ms: u64,
     pub timeout_ms: u64,
@@ -58,6 +59,11 @@ pub struct Config {
 }
 impl Config {
     pub fn validate(&self) -> Result<(), Error> {
+        if self.model_id.as_ref().is_some_and(|s| {
+            s.is_empty() || s.len() > 128 || s.bytes().any(|b| b.is_ascii_control())
+        }) {
+            return Err("invalid model_id".into());
+        }
         if !(1000..=60000).contains(&self.interval_ms)
             || self.timeout_ms == 0
             || self.timeout_ms > self.interval_ms
@@ -299,7 +305,11 @@ impl Controller {
             .iter()
             .map(|(k, p)| (k.clone(), p.description.clone()))
             .collect();
-        json!({"state":state,"questions":{"routing":{"t":"choice","ins":"Select the approved routing policy best suited to current backend health and load. Never invent a policy.","crit":criteria}}})
+        let mut request = json!({"state":state,"questions":{"routing":{"type":"choice","instructions":"Select the approved routing policy best suited to current backend health and load. Never invent a policy.","criteria":criteria}}});
+        if let Some(model) = &config.model_id {
+            request["model"] = model.clone().into();
+        }
+        request
     }
     fn choose(&mut self, config: &Config, answer: &Value) -> Result<Option<String>, Error> {
         let a = &answer["answers"]["routing"];
@@ -347,9 +357,14 @@ impl Controller {
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
             self.sequence
         );
+        // Keep counters ahead of verbose policy data so bounded-context models see the actual load.
+        let channels = status["data"]["channels"]
+            .as_array()
+            .ok_or("missing backend telemetry")?;
+        let backends:Vec<_>=channels.iter().map(|c|json!({"address":c["address"],"active":c["active"],"enabled":c["enabled"],"cooling_down":c["cooling_down"],"region":c["region"]})).collect();
         let request = Self::question(
             config,
-            json!({"observation":observation,"routing":routing["data"],"backends":status["data"]}),
+            json!({"observation":observation,"generation":generation,"backend_generation":backend_generation,"backends":backends}),
         );
         let answer = model
             .json(hyper::Method::POST, "/v1/systemone", Some(&request))
@@ -388,6 +403,12 @@ mod tests {
     fn approved_choices_are_bounded_confirmed_and_reset_on_failure() {
         let mut config = fixture_config();
         config.validate().unwrap();
+        config.model_id = Some("multilingual".into());
+        config.validate().unwrap();
+        assert_eq!(
+            Controller::question(&config, json!({}))["model"],
+            "multilingual"
+        );
         let mut controller = Controller::default();
         let answer =
             json!({"answers":{"routing":{"type":"choice","choice":"prefer-a","confidence":0.9}}});
@@ -406,8 +427,17 @@ mod tests {
             assert!(controller.choose(&config, &bad).is_err());
         }
         assert_eq!(
-            Controller::question(&config, json!({}))["questions"]["routing"]["t"],
+            Controller::question(&config, json!({}))["questions"]["routing"]["type"],
             "choice"
+        );
+        let question = Controller::question(&config, json!({}));
+        assert!(question["questions"]["routing"]["instructions"].is_string());
+        assert_eq!(
+            question["questions"]["routing"]["criteria"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
         );
         config.ttl_ms = 100;
         assert!(config.validate().is_err());
@@ -502,7 +532,10 @@ mod tests {
                         let request: Value =
                             serde_json::from_slice(&bytes[end..end + length]).unwrap();
                         assert!(request["state"]["observation"].is_string());
-                        assert_eq!(request["questions"]["routing"]["t"], "choice");
+                        assert_eq!(request["questions"]["routing"]["type"], "choice");
+                        assert!(request["questions"]["routing"].get("t").is_none());
+                        assert!(request["state"].get("routing").is_none());
+                        assert_eq!(request["state"]["backends"][0]["active"], 12);
                         (
                             200,
                             json!({"answers":{"routing":{"type":"choice","choice":"prefer-a"}}})

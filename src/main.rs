@@ -102,7 +102,7 @@ struct ClientInfo {
 impl ClientInfo {
     fn context(&self) -> decision::Client<'_> {
         decision::Client {
-            ip: self.peer.ip(),
+            ip: self.peer.ip().to_canonical(),
             tls_version: self.tls_version,
             sni: self.sni.as_deref(),
             metadata: Some(&self.metadata),
@@ -641,6 +641,22 @@ fn reload_compatible(active: &Config, next: &Config) -> Result<(), Error> {
 mod proxy_protocol_tests {
     use super::proxy_v2_header;
     use std::net::SocketAddr;
+
+    #[test]
+    fn mapped_peers_have_canonical_routing_identity() {
+        let info = super::ClientInfo {
+            peer: "[::ffff:192.0.2.1]:1234".parse().unwrap(),
+            destination: "[::]:443".parse().unwrap(),
+            sni: None,
+            tls_version: None,
+            metadata: Default::default(),
+        };
+        assert_eq!(
+            info.context().ip,
+            "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert!(info.peer.is_ipv6()); // Transport metadata remains intact for PROXY v2.
+    }
 
     #[test]
     fn proxy_v2_encodes_ipv4_addresses_ports_and_signature() {

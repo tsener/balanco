@@ -90,6 +90,7 @@ impl GeoIp {
             .is_some_and(|r| now().saturating_sub(r.metadata().build_epoch) > self.max_age_seconds)
     }
     pub fn country(&self, ip: IpAddr) -> Option<String> {
+        let ip = ip.to_canonical();
         self.lookups.fetch_add(1, Ordering::Relaxed);
         let country = (|| {
             if !public(ip) || self.stale() {
@@ -178,6 +179,11 @@ mod tests {
             old.country("8.8.8.8".parse().unwrap()).as_deref(),
             Some("BG")
         );
+        assert_eq!(
+            old.country("::ffff:8.8.8.8".parse().unwrap()).as_deref(),
+            Some("BG")
+        );
+        assert_eq!(old.country("::ffff:127.0.0.1".parse().unwrap()), None);
         assert_eq!(
             old.country("2606:4700::1111".parse().unwrap()).as_deref(),
             Some("BG")

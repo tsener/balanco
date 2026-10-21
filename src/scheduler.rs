@@ -283,7 +283,7 @@ impl Pool {
         if let Operation::Preview(preview) = operation {
             crate::decision::State::validate_preview(preview)?;
             let client = Client {
-                ip: preview.client_ip,
+                ip: preview.client_ip.to_canonical(),
                 tls_version: preview.tls_version.as_deref(),
                 sni: preview.sni.as_deref(),
                 metadata: Some(&preview.metadata),
