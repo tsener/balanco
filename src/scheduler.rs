@@ -63,6 +63,7 @@ struct Channel {
     config_generation: u64,
 }
 struct State {
+    routing: crate::decision::State,
     channels: Vec<Channel>,
     weights: Vec<u32>,
     hash_groups: Vec<u16>,
@@ -132,6 +133,7 @@ impl Pool {
     pub fn new(backends: Vec<Backend>, cooldown: Duration, scheduler: Box<dyn Scheduler>) -> Self {
         Self {
             state: Mutex::new(State {
+                routing: crate::decision::State::default(),
                 scheduler,
                 weights: backends.iter().map(|b| b.weight).collect(),
                 channels: backends
@@ -158,6 +160,7 @@ impl Pool {
     // Called after reload preparation; generations discard old establishment results.
     pub fn reconfigure(&self, config: &crate::config::Config) {
         let mut state = self.state.lock().expect("scheduler panicked");
+        state.routing.invalidate();
         let old_counters: std::collections::HashMap<_, _> = state
             .channels
             .iter()
@@ -198,15 +201,145 @@ impl Pool {
     pub fn acquire(&self, attempted: &[bool]) -> Option<Lease> {
         self.acquire_for(attempted, "127.0.0.1".parse().unwrap())
     }
-    // Called by Proxy::relay; reserve an eligible backend before starting network I/O.
+    #[cfg(test)]
     pub fn acquire_for(&self, attempted: &[bool], peer: IpAddr) -> Option<Lease> {
+        self.acquire_for_context(
+            attempted,
+            crate::decision::Client {
+                ip: peer,
+                tls_version: None,
+                sni: None,
+            },
+        )
+    }
+    // Called by Proxy::relay; reserve an eligible backend before starting network I/O.
+    pub fn acquire_for_context(
+        &self,
+        attempted: &[bool],
+        client: crate::decision::Client<'_>,
+    ) -> Option<Lease> {
         let mut state = self.state.lock().expect("scheduler panicked");
         let now = Instant::now();
+        let (weights, eligible, selection) = state.candidates(attempted, client, now);
+        let count = state.channels.len();
+        let index = match selection {
+            crate::decision::Selection::Profile(profile) => {
+                state
+                    .routing
+                    .select(profile, &weights[..count], &eligible[..count])
+            }
+            crate::decision::Selection::Configured => state
+                .scheduler
+                .select(&weights[..count], &eligible[..count]),
+            crate::decision::Selection::Reject => None,
+        }?;
+        if index >= count || !eligible[index] {
+            return None;
+        }
+        let channel = &state.channels[index];
+        channel.counters.active.fetch_add(1, Ordering::Relaxed);
+        channel.counters.total.fetch_add(1, Ordering::Relaxed);
+        Some(Lease {
+            index,
+            backend: channel.backend.clone(),
+            counters: channel.counters.clone(),
+            health_epoch: channel.health_epoch,
+            config_generation: channel.config_generation,
+        })
+    }
+
+    // Shared by HTTPS and Unix control; publication and backend selection share one lock.
+    pub fn routing(&self, operation: &crate::decision::Operation) -> Result<Reply, crate::Error> {
+        use crate::decision::{Client, Operation};
+        let mut state = self.state.lock().expect("scheduler panicked");
+        let now = Instant::now();
+        match operation {
+            Operation::Apply(update) => {
+                let backends: Vec<_> = state.channels.iter().map(|c| c.backend.clone()).collect();
+                let generation = state.generation;
+                state
+                    .routing
+                    .apply(update.clone(), generation, &backends, now)?;
+            }
+            Operation::Clear {
+                expected_generation,
+            } => state.routing.clear(*expected_generation)?,
+            Operation::Show | Operation::Preview(_) => (),
+        }
+        let mut data = state.routing.status(now);
+        data["backend_generation"] = state.generation.into();
+        if let Operation::Preview(preview) = operation {
+            crate::decision::State::validate_preview(preview)?;
+            let client = Client {
+                ip: preview.client_ip,
+                tls_version: preview.tls_version.as_deref(),
+                sni: preview.sni.as_deref(),
+            };
+            let (weights, eligible, selection) = state.candidates(&[false; 256], client, now);
+            data["profile"] = serde_json::json!(state.routing.profile_name(selection));
+            data["candidates"] = serde_json::json!(state.channels.iter().enumerate().map(|(i,c)|
+                serde_json::json!({"address":c.backend.address,"effective_weight":weights[i],"eligible":eligible[i]})).collect::<Vec<_>>());
+        }
+        Ok(Reply {
+            ok: true,
+            group: 0,
+            generation: state.routing.generation,
+            output: serde_json::to_string_pretty(&data)?,
+            data,
+            quit: false,
+            shutdown: false,
+        })
+    }
+    // Called on establishment failure; stale attempts cannot reapply a cleared cooldown.
+    pub fn failed(&self, index: usize, config_generation: u64, health_epoch: u64) {
+        let mut state = self.state.lock().expect("scheduler panicked");
+        let failed_until = Instant::now() + state.cooldown;
+        let autodisable = state.autodisable;
+        let channel = &mut state.channels[index];
+        if channel.config_generation != config_generation || channel.health_epoch != health_epoch {
+            return;
+        }
+        channel.failed_until = failed_until;
+        channel.disabled |= autodisable;
+        channel.health_epoch = channel.health_epoch.wrapping_add(1);
+    }
+    pub fn succeeded(&self, index: usize, config_generation: u64) {
+        let mut state = self.state.lock().expect("scheduler panicked");
+        let channel = &mut state.channels[index];
+        if channel.config_generation != config_generation {
+            return;
+        }
+        if !channel.disabled {
+            channel.failed_until = Instant::now();
+            channel.health_epoch = channel.health_epoch.wrapping_add(1);
+        }
+    }
+
+    pub fn uses_tls(&self) -> bool {
+        self.state.lock().expect("scheduler panicked").upstream_tls
+    }
+}
+
+impl State {
+    fn candidates(
+        &self,
+        attempted: &[bool],
+        client: crate::decision::Client<'_>,
+        now: Instant,
+    ) -> ([u32; 256], [bool; 256], crate::decision::Selection) {
+        let state = self;
+        let peer = client.ip;
+        let selection = state.routing.selection(client, now);
+        let mut weights = [0; 256];
+        state
+            .routing
+            .weights(selection, &state.weights, &mut weights);
         // Fixed arrays avoid heap allocation on each selection; config caps backend count at 256.
         let mut eligible = [false; 256];
         for (i, channel) in state.channels.iter().enumerate() {
             let b = &channel.backend;
             eligible[i] = b.weight > 0
+                && weights[i] > 0
                 && !channel.disabled
                 && !attempted[i]
                 && channel.failed_until <= now
@@ -244,54 +377,12 @@ impl Pool {
         for (i, b) in state.channels.iter().enumerate() {
             eligible[i] &= Some(b.backend.priority) == priority;
         }
-        let State {
-            scheduler, weights, ..
-        } = &mut *state;
-        let index = scheduler.select(weights, &eligible[..weights.len()])?;
-        if index >= state.channels.len() || !eligible[index] {
-            return None;
-        }
-        let channel = &state.channels[index];
-        channel.counters.active.fetch_add(1, Ordering::Relaxed);
-        channel.counters.total.fetch_add(1, Ordering::Relaxed);
-        Some(Lease {
-            index,
-            backend: channel.backend.clone(),
-            counters: channel.counters.clone(),
-            health_epoch: channel.health_epoch,
-            config_generation: channel.config_generation,
-        })
+        (weights, eligible, selection)
     }
-    // Called on establishment failure; stale attempts cannot reapply a cleared cooldown.
-    pub fn failed(&self, index: usize, config_generation: u64, health_epoch: u64) {
-        let mut state = self.state.lock().expect("scheduler panicked");
-        let failed_until = Instant::now() + state.cooldown;
-        let autodisable = state.autodisable;
-        let channel = &mut state.channels[index];
-        if channel.config_generation != config_generation || channel.health_epoch != health_epoch {
-            return;
-        }
-        channel.failed_until = failed_until;
-        channel.disabled |= autodisable;
-        channel.health_epoch = channel.health_epoch.wrapping_add(1);
-    }
-    pub fn succeeded(&self, index: usize, config_generation: u64) {
-        let mut state = self.state.lock().expect("scheduler panicked");
-        let channel = &mut state.channels[index];
-        if channel.config_generation != config_generation {
-            return;
-        }
-        if !channel.disabled {
-            channel.failed_until = Instant::now();
-            channel.health_epoch = channel.health_epoch.wrapping_add(1);
-        }
-    }
+}
 
-    pub fn uses_tls(&self) -> bool {
-        self.state.lock().expect("scheduler panicked").upstream_tls
-    }
-
-    // Called by control::execute; serialize live changes with backend selection.
+impl Pool {
+    // Called by control::execute; administrative changes invalidate external decisions.
     pub fn command(
         &self,
         mut group: u16,
@@ -316,7 +407,7 @@ impl Pool {
                 .ok_or_else(|| "unknown channel".into())
         };
         let output = match args {
-            ["help" | "?"] => "show; group N; create HOST PORT [TLS_NAME]; enable N; disable N; maxc N LIMIT; weight N VALUE; rr; hash; reset N; mrtg-bytes G N; mrtg-conns G N; http-show; http-rules FILE; version; quit; kill".into(),
+            ["help" | "?"] => "show; group N; create HOST PORT [TLS_NAME]; enable N; disable N; maxc N LIMIT; weight N VALUE; rr; hash; reset N; mrtg-bytes G N; mrtg-conns G N; http-show; http-rules FILE; routing-show; routing-apply FILE; routing-preview FILE; routing-clear GENERATION; version; quit; kill".into(),
             ["version"] => format!("balanco {}; MAXCHANNELS=256 total; group IDs 0..65535", env!("CARGO_PKG_VERSION")),
             ["quit"] => { quit = true; "bye".into() }
             ["kill"] => { shutdown = true; changed = true; "draining connections".into() }
@@ -385,6 +476,7 @@ impl Pool {
             _ => return Err("invalid command or arguments; use help".into()),
         };
         if changed {
+            state.routing.invalidate();
             state.generation += 1;
         }
         Ok(Reply {
@@ -591,5 +683,38 @@ mod tests {
             let pool = Pool::new(backends, Duration::from_secs(1), Box::new(BadPlugin(index)));
             assert!(pool.acquire(&[true]).is_none());
         }
+    }
+
+    #[test]
+    fn routing_cannot_override_admin_health_or_capacity_and_reload_invalidates_it() {
+        use crate::decision::{Operation, Preview};
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({"backends":[
+            {"address":"127.0.0.1:1","weight":0}, {"address":"127.0.0.1:2","max_connections":1}]}))
+        .unwrap();
+        let pool = Pool::from_config(&config);
+        let update=serde_json::from_value(serde_json::json!({"expected_generation":0,"backend_generation":0,"ttl_ms":10000,
+            "source_revision":"unit-1","on_expiry":"reject","profiles":{"default":{"weights":{"127.0.0.1:1":100,"127.0.0.1:2":1}}}})).unwrap();
+        pool.routing(&Operation::Apply(update)).unwrap();
+        let preview = Operation::Preview(Preview {
+            client_ip: "127.0.0.1".parse().unwrap(),
+            tls_version: None,
+            sni: None,
+        });
+        let before = pool.routing(&preview).unwrap();
+        assert_eq!(before.data["candidates"][0]["eligible"], false);
+        assert_eq!(before.data["candidates"][1]["eligible"], true);
+        let lease = pool.acquire(&[false; 2]).unwrap();
+        assert_eq!(lease.index, 1);
+        assert!(pool.acquire(&[false; 2]).is_none());
+        pool.failed(1, lease.config_generation, lease.health_epoch);
+        drop(lease);
+        assert!(pool.acquire(&[false; 2]).is_none());
+        pool.succeeded(1, 0);
+        assert_eq!(pool.acquire(&[false; 2]).unwrap().index, 1);
+        pool.reconfigure(&config);
+        let after = pool.routing(&Operation::Show).unwrap();
+        assert!(after.data["policy"].is_null());
+        assert_eq!(after.data["generation"], 2);
+        assert_eq!(after.data["backend_generation"], 1);
     }
 }

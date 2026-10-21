@@ -40,6 +40,7 @@ Start with [TCP](examples/tcp.json), [two-leg mTLS](examples/mtls.json), [HTTP h
 - [Operations, TLS, reloads and live administration](docs/operations.md)
 - [HTTP header rules and compiled plugin API](docs/http-plugins.md)
 - [Architecture and code call flow](docs/architecture.md)
+- [External weight decisions and routing API](docs/routing-api.md)
 
 **Status:** early software, not a production-capacity guarantee. TLS 1.2/1.3 only; no TLS 1.0/1.1, HTTP/2/3, OCSP stapling, embedded ACME client or dynamic plugin loader. HTTP hooks act on headers, not WebSocket payloads. CI produces a Linux x86-64 build; static and cross-architecture packaging are separate work.
 

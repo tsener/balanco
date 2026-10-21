@@ -36,6 +36,8 @@ pub struct Request {
     pub command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_rules: Option<crate::http1::RuleUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<crate::decision::Operation>,
 }
 
 fn uid() -> u32 {
@@ -100,6 +102,20 @@ impl Drop for Controls {
     }
 }
 
+// Called on the blocking pool by start; finish owner checks and permissions before accepting.
+fn bind_control(path: PathBuf) -> Result<(std::os::unix::net::UnixListener, SocketGuard), Error> {
+    directory(&path, true)?;
+    // Never unlink an existing socket: it may belong to a live instance.
+    let local = std::os::unix::net::UnixListener::bind(&path)?;
+    let guard = SocketGuard {
+        inode: fs::symlink_metadata(&path)?.ino(),
+        path: path.clone(),
+    };
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    local.set_nonblocking(true)?;
+    Ok((local, guard))
+}
+
 // Called by main::run; bind control listeners separately from workload traffic.
 pub async fn start(
     config: &Config,
@@ -116,14 +132,9 @@ pub async fn start(
             .map(default_config_path)
             .unwrap_or_else(|| default_path(address))
     });
-    directory(&path, true)?;
-    // Never unlink an existing socket: it may belong to a live instance.
-    let local = UnixListener::bind(&path)?;
-    let guard = SocketGuard {
-        inode: fs::symlink_metadata(&path)?.ino(),
-        path: path.clone(),
-    };
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    let socket_path = path.clone();
+    let (local, guard) = tokio::task::spawn_blocking(move || bind_control(socket_path)).await??;
+    let local = UnixListener::from_std(local)?;
     let remote = match &config.management {
         Some(m) => Some((TcpListener::bind(m.listen).await?, m.clone())),
         None => None,
@@ -223,6 +234,7 @@ async fn line<S: AsyncRead + Unpin>(stream: &mut S, limit: usize) -> Result<Vec<
     }
 }
 async fn http_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request, Error> {
+    use crate::decision::Operation;
     let mut bytes = Vec::new();
     while !bytes.ends_with(b"\r\n\r\n") {
         if bytes.len() == 8192 {
@@ -270,22 +282,65 @@ async fn http_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request, E
             group: 0,
             command: "show".into(),
             http_rules: None,
+            routing: None,
         }),
         (Some("GET"), Some("/v1/http")) if length.unwrap_or(0) == 0 => Ok(Request {
-            group: 0, command: "http-show".into(), http_rules: None,
+            group: 0,
+            command: "http-show".into(),
+            http_rules: None,
+            routing: None,
         }),
-        (Some("POST"), Some("/v1/command")) | (Some("PUT"), Some("/v1/http/rules")) if json => {
+        (Some("GET"), Some("/v1/routing")) if length.unwrap_or(0) == 0 => Ok(Request {
+            group: 0,
+            command: "routing".into(),
+            http_rules: None,
+            routing: Some(Operation::Show),
+        }),
+        (Some("POST"), Some("/v1/command" | "/v1/routing/preview"))
+        | (Some("PUT"), Some("/v1/http/rules" | "/v1/routing"))
+        | (Some("DELETE"), Some("/v1/routing"))
+            if json =>
+        {
             let length = length.ok_or("Content-Length required")?;
             if length > REQUEST_LIMIT {
                 return Err("body exceeds 16384 bytes".into());
             }
             let mut body = vec![0; length];
             stream.read_exact(&mut body).await?;
-            if request.method == Some("PUT") {
-                Ok(Request {group:0,command:"http-rules".into(),http_rules:Some(serde_json::from_slice(&body)?)})
-            } else { Ok(serde_json::from_slice(&body)?) }
+            if request.path == Some("/v1/command") {
+                return Ok(serde_json::from_slice(&body)?);
+            }
+            if request.path == Some("/v1/http/rules") {
+                return Ok(Request {
+                    group: 0,
+                    command: "http-rules".into(),
+                    http_rules: Some(serde_json::from_slice(&body)?),
+                    routing: None,
+                });
+            }
+            let operation = match request.method {
+                Some("PUT") => Operation::Apply(serde_json::from_slice(&body)?),
+                Some("DELETE") => {
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Clear {
+                        expected_generation: u64,
+                    }
+                    Operation::Clear {
+                        expected_generation: serde_json::from_slice::<Clear>(&body)?
+                            .expected_generation,
+                    }
+                }
+                _ => Operation::Preview(serde_json::from_slice(&body)?),
+            };
+            Ok(Request {
+                group: 0,
+                command: "routing".into(),
+                http_rules: None,
+                routing: Some(operation),
+            })
         }
-        _ => Err("use GET /v1/status, GET /v1/http, POST /v1/command or PUT /v1/http/rules with application/json".into()),
+        _ => Err("unsupported management method/path or missing application/json".into()),
     }
 }
 async fn respond<S: AsyncWrite + Unpin>(
@@ -326,6 +381,34 @@ async fn dispatch(
     request: &Request,
     role: Role,
 ) -> (Reply, u16) {
+    if let Some(operation) = &request.routing {
+        if request.command != "routing" || request.http_rules.is_some() {
+            return (
+                Reply::error(0, "routing operation requires only the routing command"),
+                400,
+            );
+        }
+        if operation.writes() && role != Role::Admin {
+            return (
+                Reply::error(0, "permission denied: admin role required"),
+                403,
+            );
+        }
+        return match pool.routing(operation) {
+            Ok(reply) => (reply, 200),
+            Err(error) => {
+                let status = if error.to_string().starts_with("routing generation conflict") {
+                    409
+                } else {
+                    400
+                };
+                (Reply::error(0, error), status)
+            }
+        };
+    }
+    if request.command == "routing" {
+        return (Reply::error(0, "routing operation required"), 400);
+    }
     if !matches!(request.command.as_str(), "http-show" | "http-rules") {
         if request.http_rules.is_some() {
             return (
@@ -444,6 +527,17 @@ pub async fn execute(pool: &Pool, request: &Request, role: Role) -> (Reply, u16)
     }
 }
 
+fn control_file(path: &str) -> Result<Vec<u8>, Error> {
+    let mut input = Vec::new();
+    fs::File::open(path.trim())?
+        .take(REQUEST_LIMIT as u64 + 1)
+        .read_to_end(&mut input)?;
+    if input.len() > REQUEST_LIMIT {
+        return Err("control update exceeds 16384 bytes".into());
+    }
+    Ok(input)
+}
+
 fn call(path: &Path, group: u16, command: &str) -> Result<Reply, Error> {
     directory(path, false)?;
     let meta = fs::symlink_metadata(path)?;
@@ -457,17 +551,32 @@ fn call(path: &Path, group: u16, command: &str) -> Result<Reply, Error> {
         group,
         command: command.to_owned(),
         http_rules: None,
+        routing: None,
     };
     if let Some(path) = command.strip_prefix("http-rules ") {
-        let mut input = Vec::new();
-        fs::File::open(path.trim())?
-            .take(REQUEST_LIMIT as u64 + 1)
-            .read_to_end(&mut input)?;
-        if input.len() > REQUEST_LIMIT {
-            return Err("HTTP rule update exceeds 16384 bytes".into());
-        }
         request.command = "http-rules".into();
-        request.http_rules = Some(serde_json::from_slice(&input)?);
+        request.http_rules = Some(serde_json::from_slice(&control_file(path)?)?);
+    }
+    let routing = if command == "routing-show" {
+        Some(crate::decision::Operation::Show)
+    } else if let Some(path) = command.strip_prefix("routing-apply ") {
+        Some(crate::decision::Operation::Apply(serde_json::from_slice(
+            &control_file(path)?,
+        )?))
+    } else if let Some(path) = command.strip_prefix("routing-preview ") {
+        Some(crate::decision::Operation::Preview(serde_json::from_slice(
+            &control_file(path)?,
+        )?))
+    } else if let Some(generation) = command.strip_prefix("routing-clear ") {
+        Some(crate::decision::Operation::Clear {
+            expected_generation: generation.trim().parse()?,
+        })
+    } else {
+        None
+    };
+    if let Some(operation) = routing {
+        request.command = "routing".into();
+        request.routing = Some(operation);
     }
     let mut bytes = serde_json::to_vec(&request)?;
     if bytes.len() > REQUEST_LIMIT {

@@ -186,9 +186,6 @@ impl Config {
         if let Some(http) = &self.http1 {
             http.validate()?;
         }
-        if self.reuse_port && self.management.is_some() {
-            return Err("management API is incompatible with reuse_port workers".into());
-        }
         if self.reuse_port && self.control_socket.is_none() {
             return Err("reuse_port workers require a unique control_socket".into());
         }

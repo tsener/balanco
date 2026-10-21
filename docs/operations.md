@@ -58,6 +58,10 @@ balanco --config examples/tcp.json -c 'group 0; disable 1; show'
 
 ## mTLS management API
 
+Linux instances may share a data IP/port with `reuse_port: true`, while each binds a different `management.listen` address/port and a unique `control_socket`. For example, all replicas can use data `0.0.0.0:8443`, APIs `127.0.0.1:9441`, `:9442`, `:9443`, and control sockets `/run/balanco/instance-1.sock`, etc. Each API has its own certificate allowlist and independent state. A port collision fails startup and leaves existing instances intact.
+
+`SO_REUSEPORT` distributes TCP flows before TLS/SNI or HTTP is parsed. Shared-port replicas must accept the same workload/client population; this is not per-tenant dispatch. Keep their data-plane TLS and routing policies compatible. API changes affect only the addressed process; a controller must publish separately to each replica. Limits, cooldown, counters and round-robin state are per process, and no fleet-wide atomic update or shared connection cap is provided.
+
 [management.json](../examples/management.json) declares a separate HTTPS listener, required client CA, and exact leaf-certificate allowlist with `admin` or `read_only` roles. Give each operator/automation its own identity. A CA-trusted but unlisted client is denied. This is certificate authentication, not MFA or Kerberos.
 
 ```sh
@@ -70,6 +74,8 @@ curl --cacert management-ca.pem --cert operator.pem --key operator.key \
 ```
 
 `GET /v1/status` reads backend state. `POST /v1/command` runs a command with role checks. [HTTP plugin management](http-plugins.md) adds `GET /v1/http` and admin-only `PUT /v1/http/rules` with `expected_generation`. Requests have bounded sizes/deadlines and are audited without logging rule values. Keep this listener on a restricted management network.
+
+The [external routing API](routing-api.md) adds versioned, expiring backend-weight profiles with IP/TLS/SNI matching, status, preview and admin-only replacement/clear operations.
 
 ## Client metadata and observability
 

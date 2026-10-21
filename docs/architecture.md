@@ -23,6 +23,6 @@ SIGHUP loads config/TLS on a blocking task, checks restart-only fields and prepa
 
 `http_plugin.rs` is the public Rust header-hook API. Implementations are trusted, synchronous and compiled into the executable; register them in `http1::State::new` from `main.rs`. They must not block or perform I/O. The host protects framing and negotiation headers. Hooks stop after WebSocket Upgrade.
 
-`Scheduler` is an internal compiled extension point. The host filters eligibility and rejects invalid selections. Remote policy engines, a stable dynamic ABI and plugin sandboxing are not implemented.
+`Scheduler` is an internal compiled extension point. The host filters eligibility and rejects invalid selections. The [routing API](routing-api.md) accepts bounded external weight decisions; model calls stay outside the proxy. A stable dynamic ABI and plugin sandboxing are not implemented.
 
-Optional Linux `reuse_port` allows separately supervised processes to bind the same data address. Each retains independent health, limits and live state; management HTTPS is rejected in that mode. It is not a coordinated prefork deployment.
+Optional Linux `reuse_port` allows separately supervised processes to bind the same data address. Each retains independent health, limits and live state, with a unique control socket and its own management HTTPS port/address. It is not a coordinated prefork deployment.

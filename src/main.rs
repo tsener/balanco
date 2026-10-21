@@ -2,6 +2,7 @@
 mod cli;
 mod config;
 mod control;
+mod decision;
 mod http1;
 mod scheduler;
 mod tls;
@@ -93,6 +94,7 @@ struct ClientInfo {
     peer: std::net::SocketAddr,
     destination: std::net::SocketAddr,
     sni: Option<String>,
+    tls_version: Option<&'static str>,
 }
 impl Proxy {
     // Spawned by run; complete frontend TLS before selecting a backend.
@@ -109,6 +111,7 @@ impl Proxy {
             peer,
             destination,
             sni: None,
+            tls_version: None,
         };
         stream.set_nodelay(true)?;
         match &tls.acceptor {
@@ -118,9 +121,12 @@ impl Proxy {
                     acceptor.accept(stream),
                 )
                 .await??;
-                if config.http1.is_some() {
-                    info.sni = stream.get_ref().1.server_name().map(str::to_owned);
-                }
+                info.sni = stream.get_ref().1.server_name().map(str::to_owned);
+                info.tls_version = match stream.get_ref().1.protocol_version() {
+                    Some(tokio_rustls::rustls::ProtocolVersion::TLSv1_2) => Some("TLS1.2"),
+                    Some(tokio_rustls::rustls::ProtocolVersion::TLSv1_3) => Some("TLS1.3"),
+                    _ => None,
+                };
                 self.relay(config, stream, setup, &tls, info).await
             }
             None => self.relay(config, stream, setup, &tls, info).await,
@@ -140,7 +146,14 @@ impl Proxy {
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(config.establishment_timeout_ms);
         let mut last_error: Error = "no eligible backend".into();
-        while let Some(lease) = self.pool.acquire_for(&attempted, peer.ip()) {
+        while let Some(lease) = self.pool.acquire_for_context(
+            &attempted,
+            decision::Client {
+                ip: peer.ip(),
+                tls_version: info.tls_version,
+                sni: info.sni.as_deref(),
+            },
+        ) {
             let i = lease.index;
             attempted[i] = true;
             let attempt_deadline = deadline.min(

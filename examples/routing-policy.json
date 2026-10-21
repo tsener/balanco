@@ -1,0 +1,17 @@
+{
+  "expected_generation": 0,
+  "backend_generation": 0,
+  "ttl_ms": 30000,
+  "source_revision": "example-1",
+  "on_expiry": "configured",
+  "profiles": {
+    "default": {"weights": {"127.0.0.1:9001": 3, "127.0.0.1:9002": 1}},
+    "older-devices": {"weights": {"127.0.0.1:9002": 1}}
+  },
+  "assignments": [
+    {
+      "match": {"source_cidr": "127.0.0.0/8", "tls_version": "TLS1.2"},
+      "profile": "older-devices"
+    }
+  ]
+}
