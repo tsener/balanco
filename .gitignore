@@ -1,5 +1,9 @@
 # Build outputs and local toolchains
 /target/
+/coverage/
+/.scannerwork/
+*.profraw
+*.profdata
 /.tools/
 /.venv/
 /venv/

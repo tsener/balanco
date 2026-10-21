@@ -17,6 +17,7 @@ concurrency:
 jobs:
   sonarqube:
     name: SonarQube
+    needs: linux
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -24,6 +25,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Download coverage report
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rust-coverage
+          path: coverage
       - name: Cache SonarQube packages
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -50,13 +56,25 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends build-essential cmake
-          rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy
+          rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
       - name: Format
         run: cargo +1.90.0 fmt --all -- --check
       - name: Lint
         run: cargo +1.90.0 clippy --locked --all-targets -- -D warnings
-      - name: Inline unit checks
-        run: cargo +1.90.0 test --locked
+      - name: Install coverage tool
+        run: cargo +1.90.0 install cargo-llvm-cov --version 0.9.1 --locked
+      - name: Inline unit checks and coverage
+        run: |
+          mkdir -p coverage
+          cargo +1.90.0 llvm-cov --locked --all-targets --remap-path-prefix --lcov --output-path coverage/lcov.info
+          test -s coverage/lcov.info
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-coverage
+          path: coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 14
       - name: Build release and plugin example
         run: |
           cargo +1.90.0 build --locked --release
