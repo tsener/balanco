@@ -1,5 +1,9 @@
 # Balanco
 
+<p align="center">
+  <img src="assets/balanco-logo.png" alt="BALANCO in Hoover Dam-inspired Art Deco lettering" width="720">
+</p>
+
 [![Build](https://github.com/tsener/balanco/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/tsener/balanco/actions/workflows/build.yml)
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
