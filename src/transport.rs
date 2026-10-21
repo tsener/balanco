@@ -126,3 +126,65 @@ pub async fn copy<A: AsyncRead + AsyncWrite + Unpin, B: AsyncRead + AsyncWrite +
         _ = activity.expire(idle_ms.unwrap_or(0)), if idle_ms.is_some() => Err(io::Error::new(io::ErrorKind::TimedOut, "connection idle timeout")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    #[tokio::test]
+    async fn bounded_relay_preserves_half_close_backpressure_and_counters() {
+        for idle in [None, Some(1000)] {
+            let (mut client, mut front) = duplex(16);
+            let (mut back, mut origin) = duplex(16);
+            let counters = crate::scheduler::Counters::default();
+            let payload = vec![b'x'; 4097];
+            let exchange = async {
+                client.write_all(&payload).await.unwrap();
+                client.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                client.read_to_end(&mut reply).await.unwrap();
+                assert_eq!(reply, b"ack");
+            };
+            let workload = async {
+                let mut received = Vec::new();
+                origin.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, payload);
+                origin.write_all(b"ack").await.unwrap();
+                origin.shutdown().await.unwrap();
+            };
+            let (result, (), ()) = tokio::join!(
+                copy(&mut front, &mut back, 32, idle, false, &counters),
+                exchange,
+                workload
+            );
+            assert_eq!(result.unwrap(), (4097, 3));
+            assert_eq!(counters.up.load(Ordering::Relaxed), 4097);
+            assert_eq!(counters.down.load(Ordering::Relaxed), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn quiet_open_sessions_expire_and_io_errors_propagate() {
+        let (_client, mut front) = duplex(16);
+        let (mut back, _origin) = duplex(16);
+        let counters = crate::scheduler::Counters::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            copy(&mut front, &mut back, 16, Some(25), false, &counters),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let (mut client, mut front) = duplex(16);
+        let (mut back, origin) = duplex(16);
+        drop(origin);
+        client.write_all(b"data").await.unwrap();
+        assert!(
+            copy(&mut front, &mut back, 16, None, false, &counters)
+                .await
+                .is_err()
+        );
+        dump("test", b"\n\0").unwrap();
+    }
+}

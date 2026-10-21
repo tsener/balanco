@@ -55,7 +55,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends build-essential cmake
+          sudo apt-get install -y --no-install-recommends build-essential cmake openssl
           rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
       - name: Format
         run: cargo +1.90.0 fmt --all -- --check

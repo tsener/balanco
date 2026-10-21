@@ -640,3 +640,326 @@ pub fn client(path: PathBuf, command: Option<String>) -> Result<(), Error> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decision::Operation;
+
+    fn config() -> Config {
+        serde_json::from_str(
+            r#"{"backends":[{"address":"127.0.0.1:9001"},{"address":"127.0.0.1:9002"}]}"#,
+        )
+        .unwrap()
+    }
+    fn request(command: &str) -> Request {
+        Request {
+            group: 0,
+            command: command.into(),
+            http_rules: None,
+            routing: None,
+        }
+    }
+    async fn parse(bytes: &[u8]) -> Result<Request, Error> {
+        let (mut client, mut server) = tokio::io::duplex(32768);
+        client.write_all(bytes).await.unwrap();
+        client.shutdown().await.unwrap();
+        http_request(&mut server).await
+    }
+    fn message(method: &str, path: &str, body: &str) -> Vec<u8> {
+        format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",body.len()).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn management_parser_routes_valid_requests_and_rejects_ambiguous_framing() {
+        for (path, command) in [
+            ("/v1/status", "show"),
+            ("/v1/http", "http-show"),
+            ("/v1/routing", "routing"),
+        ] {
+            assert_eq!(
+                parse(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap()
+                    .command,
+                command
+            );
+        }
+        let policy = include_str!("../examples/routing-policy.json");
+        assert!(matches!(
+            parse(&message("PUT", "/v1/routing", policy))
+                .await
+                .unwrap()
+                .routing,
+            Some(Operation::Apply(_))
+        ));
+        assert!(matches!(
+            parse(&message(
+                "DELETE",
+                "/v1/routing",
+                r#"{"expected_generation":1}"#
+            ))
+            .await
+            .unwrap()
+            .routing,
+            Some(Operation::Clear {
+                expected_generation: 1
+            })
+        ));
+        assert!(matches!(
+            parse(&message(
+                "POST",
+                "/v1/routing/preview",
+                r#"{"client_ip":"::1"}"#
+            ))
+            .await
+            .unwrap()
+            .routing,
+            Some(Operation::Preview(_))
+        ));
+        assert!(
+            parse(&message(
+                "PUT",
+                "/v1/http/rules",
+                r#"{"expected_generation":1,"rules":[]}"#
+            ))
+            .await
+            .unwrap()
+            .http_rules
+            .is_some()
+        );
+        assert_eq!(
+            parse(&message(
+                "POST",
+                "/v1/command",
+                r#"{"command":"show","group":1}"#
+            ))
+            .await
+            .unwrap()
+            .group,
+            1
+        );
+        for raw in [
+            "GET /v1/status HTTP/1.0\r\nHost: localhost\r\n\r\n",
+            "GET /v1/status HTTP/1.1\r\n\r\n",
+            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nHost: other\r\n\r\n",
+            "GET /v1/status HTTP/1.1\r\nHost:\r\n\r\n",
+            "POST /v1/command HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+            "POST /v1/command HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "POST /v1/command HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\n\r\n",
+            "POST /v1/command HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n",
+            "POST /v1/command HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 16385\r\n\r\n",
+            "POST /v1/command HTTP/1.1\r\nHost: localhost\r\nContent-Length: -1\r\n\r\n",
+            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx",
+        ] {
+            assert!(parse(raw.as_bytes()).await.is_err(), "accepted {raw:?}");
+        }
+        for body in ["{", r#"{"expected_generation":1,"unknown":true}"#] {
+            assert!(
+                parse(&message("DELETE", "/v1/routing", body))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(parse(&message("PUT", "/v1/unknown", "{}")).await.is_err());
+        assert!(parse(&vec![b'x'; 8193]).await.is_err());
+        let (mut client, mut server) = tokio::io::duplex(16);
+        client.write_all(b"abcde\n").await.unwrap();
+        assert!(line(&mut server, 4).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn role_checks_and_generations_protect_routing_and_header_updates() {
+        let config = config();
+        let pool = Pool::from_config(&config);
+        let http = crate::http1::State::new(Some(Arc::new(Default::default())), vec![]);
+        let update = serde_json::from_str(include_str!("../examples/routing-policy.json")).unwrap();
+        let apply = Request {
+            routing: Some(Operation::Apply(update)),
+            ..request("routing")
+        };
+        assert_eq!(dispatch(&pool, &http, &apply, Role::ReadOnly).await.1, 403);
+        assert_eq!(dispatch(&pool, &http, &apply, Role::Admin).await.1, 200);
+        assert_eq!(dispatch(&pool, &http, &apply, Role::Admin).await.1, 409);
+        let show = Request {
+            routing: Some(Operation::Show),
+            ..request("routing")
+        };
+        assert_eq!(dispatch(&pool, &http, &show, Role::ReadOnly).await.1, 200);
+        assert_eq!(
+            dispatch(&pool, &http, &request("routing"), Role::Admin)
+                .await
+                .1,
+            400
+        );
+        let mixed = Request {
+            routing: Some(Operation::Show),
+            ..request("show")
+        };
+        assert_eq!(dispatch(&pool, &http, &mixed, Role::Admin).await.1, 400);
+        let clear = Request {
+            routing: Some(Operation::Clear {
+                expected_generation: 1,
+            }),
+            ..request("routing")
+        };
+        assert_eq!(dispatch(&pool, &http, &clear, Role::ReadOnly).await.1, 403);
+        assert_eq!(dispatch(&pool, &http, &clear, Role::Admin).await.1, 200);
+        let rules = Request {
+            http_rules: Some(crate::http1::RuleUpdate {
+                expected_generation: 1,
+                rules: vec![],
+            }),
+            ..request("http-rules")
+        };
+        assert_eq!(dispatch(&pool, &http, &rules, Role::ReadOnly).await.1, 403);
+        assert_eq!(dispatch(&pool, &http, &rules, Role::Admin).await.1, 200);
+        assert_eq!(dispatch(&pool, &http, &rules, Role::Admin).await.1, 409);
+        let wrong = Request {
+            http_rules: rules.http_rules.clone(),
+            ..request("show")
+        };
+        assert_eq!(dispatch(&pool, &http, &wrong, Role::Admin).await.1, 400);
+        let wrong_show = Request {
+            http_rules: rules.http_rules.clone(),
+            ..request("http-show")
+        };
+        assert_eq!(
+            dispatch(&pool, &http, &wrong_show, Role::Admin).await.1,
+            400
+        );
+        assert_eq!(
+            dispatch(&pool, &http, &request("http-show"), Role::ReadOnly)
+                .await
+                .1,
+            200
+        );
+        for command in ["show", "help", "version", "group 0"] {
+            assert_eq!(
+                execute(&pool, &request(command), Role::ReadOnly).await.1,
+                200
+            );
+        }
+        for command in ["disable 0", "weight 0 7", "create 127.0.0.1 9003"] {
+            assert_eq!(
+                execute(&pool, &request(command), Role::ReadOnly).await.1,
+                403
+            );
+        }
+        for command in [
+            "show;kill",
+            "show\nkill",
+            "create",
+            "create 127.0.0.1 9003 extra",
+            "unknown",
+        ] {
+            assert_eq!(execute(&pool, &request(command), Role::Admin).await.1, 400);
+        }
+        assert_eq!(
+            execute(&pool, &request(&"x".repeat(4097)), Role::Admin)
+                .await
+                .1,
+            400
+        );
+        assert_eq!(
+            execute(&pool, &request("create 127.0.0.1 9003"), Role::Admin)
+                .await
+                .1,
+            200
+        );
+    }
+
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "balanco-control-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn unix_listener_permissions_owner_checks_and_cli_round_trip() {
+        let directory = Directory::new();
+        let path = directory.0.join("control.sock");
+        let mut config = config();
+        config.control_socket = Some(path.clone());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let pool = Arc::new(Pool::from_config(&config));
+        let (_, receiver) = watch::channel(Arc::new(Tls::load(&config).unwrap()));
+        let shutdown = Arc::new(Notify::new());
+        let http = Arc::new(crate::http1::State::new(None, vec![]));
+        let controls = runtime
+            .block_on(start(
+                &config,
+                config.listen,
+                pool,
+                receiver,
+                shutdown.clone(),
+                http,
+            ))
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(bind_control(path.clone()).is_err());
+        assert!(path.exists());
+        client(
+            path.clone(),
+            Some("show;version;group 0;routing-show;quit".into()),
+        )
+        .unwrap();
+        assert!(client(path.clone(), Some("x".repeat(4097))).is_err());
+        assert!(client(path.clone(), Some("routing-preview missing-file".into())).is_err());
+        client(path.clone(), Some("kill".into())).unwrap();
+        runtime
+            .block_on(async { timeout(Duration::from_secs(1), shutdown.notified()).await })
+            .unwrap();
+        drop(controls);
+        assert!(!path.exists());
+        assert_ne!(
+            default_path("127.0.0.1:1".parse().unwrap()),
+            default_path("127.0.0.1:2".parse().unwrap())
+        );
+        assert_eq!(
+            default_config_path(Path::new("a.json")),
+            default_config_path(Path::new("a.json"))
+        );
+        let unsafe_dir = directory.0.join("unsafe");
+        fs::create_dir(&unsafe_dir).unwrap();
+        fs::set_permissions(&unsafe_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(super::directory(&unsafe_dir.join("control.sock"), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn management_response_has_unambiguous_length_and_closes() {
+        for status in [200, 400, 403, 409] {
+            let (mut client, mut server) = tokio::io::duplex(32768);
+            let reply = Reply::error(0, "test error");
+            respond(&mut server, status, &reply).await.unwrap();
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            let split = bytes.windows(4).position(|b| b == b"\r\n\r\n").unwrap() + 4;
+            let header = std::str::from_utf8(&bytes[..split]).unwrap();
+            assert!(header.starts_with(&format!("HTTP/1.1 {status} ")));
+            assert!(header.contains(&format!("Content-Length: {}\r\n", bytes.len() - split)));
+            assert!(header.contains("Cache-Control: no-store\r\n"));
+            assert!(!serde_json::from_slice::<Reply>(&bytes[split..]).unwrap().ok);
+        }
+    }
+}
