@@ -107,7 +107,7 @@ sequenceDiagram
         P->>B: Raw relay or HTTP header hooks
         B-->>P: Workload response
         P-->>C: Forward response
-        Note over C,B: HTTP Upgrade switches to a pinned byte tunnel
+        Note over C,B: HTTP Upgrade switches<br/>to a pinned byte tunnel
     end
     P->>S: Release lease when session ends
 ```
@@ -132,6 +132,6 @@ sequenceDiagram
         S->>S: Atomically replace policy and advance generation
         S-->>A: 200 with new state
     end
-    Note over M,S: On expiry, use explicit configured fallback or reject new setup
-    Note over A,S: Repeat per instance, existing sessions are unaffected
+    Note over M,S: On expiry, use configured fallback<br/>or reject new setup
+    Note over A,S: Repeat per instance<br/>Existing sessions are unaffected
 ```
