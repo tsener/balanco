@@ -1,0 +1,24 @@
+{
+  "listen": "127.0.0.1:8080",
+  "workers": 2,
+  "backends": [{"address": "127.0.0.1:9000"}],
+  "http1": {
+    "max_header_bytes": 16384,
+    "header_timeout_ms": 5000,
+    "response_timeout_ms": 60000,
+    "rules": [
+      {
+        "phase": "request",
+        "action": {"op": "set", "name": "x-forwarded-for", "value": "${client_ip}"}
+      },
+      {
+        "phase": "request",
+        "action": {"op": "set", "name": "x-forwarded-proto", "value": "${scheme}"}
+      },
+      {
+        "phase": "response",
+        "action": {"op": "remove", "name": "server"}
+      }
+    ]
+  }
+}

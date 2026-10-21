@@ -1,0 +1,57 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux x86-64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential cmake
+          rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy
+      - name: Format
+        run: cargo +1.90.0 fmt --all -- --check
+      - name: Lint
+        run: cargo +1.90.0 clippy --locked --all-targets -- -D warnings
+      - name: Inline unit checks
+        run: cargo +1.90.0 test --locked
+      - name: Build release and plugin example
+        run: |
+          cargo +1.90.0 build --locked --release
+          cargo +1.90.0 run --locked --example header_plugin
+      - name: Validate plaintext examples
+        run: |
+          target/release/balanco --config examples/tcp.json --check
+          target/release/balanco --config examples/http1.json --check
+      - name: Package executable and corresponding source
+        run: |
+          mkdir dist
+          cp target/release/balanco LICENSE dist/
+          git archive --format=tar.gz --output=dist/balanco-source.tar.gz HEAD
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: balanco-linux-x86_64-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

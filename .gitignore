@@ -1,0 +1,53 @@
+# Build outputs and local toolchains
+/target/
+/.tools/
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.DS_Store
+.idea/
+.vscode/
+
+# Private verification material and original reference implementation
+/tests/
+/test/
+/research/
+/scripts/
+/balance-*/
+/PLAN.md
+/pyproject.toml
+/requirements-dev.txt
+
+# Credentials and deployment-local configuration; examples stay public
+.env
+.env.*
+!.env.example
+credentials*
+secrets*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+id_rsa*
+id_ed25519*
+authorized_keys
+known_hosts
+/certs/
+/certificates/
+/config.local.*
+
+# Raw captures, logs and generated packages
+*.pcap
+*.pcapng
+*.log
+*.tgz
+*.tar.gz
+*.zip
+*.sock
+/balanco

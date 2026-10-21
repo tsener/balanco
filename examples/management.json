@@ -1,0 +1,31 @@
+{
+  "listen": "127.0.0.1:8080",
+  "workers": 2,
+  "backends": [
+    { "address": "127.0.0.1:9001" },
+    { "address": "127.0.0.1:9002" }
+  ],
+  "management": {
+    "listen": "127.0.0.1:9443",
+    "tls": {
+      "cert": "/etc/balanco/management-server.pem",
+      "key": "/etc/balanco/management-server.key",
+      "client_ca": "/etc/balanco/management-client-ca.pem",
+      "key_exchange": "hybrid_preferred"
+    },
+    "clients": [
+      {
+        "name": "operator",
+        "cert": "/etc/balanco/operator.pem",
+        "role": "admin"
+      },
+      {
+        "name": "monitor",
+        "cert": "/etc/balanco/monitor.pem",
+        "role": "read_only"
+      }
+    ],
+    "max_connections": 16,
+    "request_timeout_ms": 5000
+  }
+}

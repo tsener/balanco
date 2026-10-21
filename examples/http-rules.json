@@ -1,0 +1,15 @@
+{
+  "expected_generation": 1,
+  "rules": [
+    {
+      "phase": "request",
+      "when": {"method": "GET", "path_prefix": "/devices/"},
+      "action": {"op": "set", "name": "x-device-gateway", "value": "balanco:${backend}"}
+    },
+    {
+      "phase": "response",
+      "when": {"status": 200},
+      "action": {"op": "remove", "name": "server"}
+    }
+  ]
+}

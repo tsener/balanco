@@ -1,0 +1,9 @@
+{
+  "listen": "127.0.0.1:8080",
+  "workers": 2,
+  "backends": [
+    { "address": "127.0.0.1:9001", "weight": 3 },
+    { "address": "127.0.0.1:9002", "weight": 1 },
+    { "address": "127.0.0.1:9003", "priority": 1 }
+  ]
+}
