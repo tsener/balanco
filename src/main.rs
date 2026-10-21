@@ -24,7 +24,7 @@ use tokio::{
     net::{TcpSocket, TcpStream},
     sync::{Notify, OwnedSemaphorePermit, Semaphore, watch},
     task::JoinSet,
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -115,9 +115,19 @@ impl Proxy {
         &self,
         config: &Config,
         stream: TcpStream,
-        setup: Option<OwnedSemaphorePermit>,
+        handshakes: Option<Arc<Semaphore>>,
         tls: Arc<tls::Tls>,
     ) -> Result<(), Error> {
+        let deadline = Instant::now() + Duration::from_millis(config.handshake_timeout_ms);
+        // Queue under the connection cap; the same deadline also bounds frontend TLS.
+        let setup = match handshakes {
+            Some(slots) => Some(
+                timeout_at(deadline, slots.acquire_owned())
+                    .await
+                    .map_err(|_| "TLS setup admission deadline elapsed")??,
+            ),
+            None => None,
+        };
         let peer = stream.peer_addr()?;
         let destination = stream.local_addr()?;
         let mut info = ClientInfo {
@@ -133,11 +143,7 @@ impl Proxy {
         stream.set_nodelay(true)?;
         match &tls.acceptor {
             Some(acceptor) => {
-                let stream = timeout(
-                    Duration::from_millis(config.handshake_timeout_ms),
-                    acceptor.accept(stream),
-                )
-                .await??;
+                let stream = timeout_at(deadline, acceptor.accept(stream)).await??;
                 info.sni = stream.get_ref().1.server_name().map(str::to_owned);
                 info.metadata.tls_cipher = stream
                     .get_ref()
@@ -514,17 +520,7 @@ async fn run(config: Config, tls: tls::Tls) -> Result<(), Error> {
                 };
                 let current = config.read().expect("config lock poisoned").clone();
                 let current_uses_tls = current.tls.is_some() || current.upstream_tls.is_some();
-                let setup = if current_uses_tls {
-                    match handshakes.clone().try_acquire_owned() {
-                        Ok(permit) => Some(permit),
-                        Err(_) => {
-                            proxy.stats.rejected.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    }
-                } else {
-                    None
-                };
+                let setup = current_uses_tls.then(|| handshakes.clone());
                 let proxy = proxy.clone();
                 let tls = tls.clone();
                 tasks.spawn(async move {
@@ -683,6 +679,100 @@ mod proxy_protocol_tests {
         let header = proxy_v2_header(src, dst).unwrap();
         assert_eq!(&header[12..16], &[0x21, 0x21, 0, 36]);
         assert_eq!(header.len(), 52);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::future::Future;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn queued_setup_resumes_and_releases_its_slot_before_streaming() {
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "backends": [{"address": origin.local_addr().unwrap()}]
+        }))
+        .unwrap();
+        let proxy = Proxy {
+            pool: Arc::new(Pool::from_config(&config)),
+            http: Arc::new(http1::State::new(config.http1.clone(), vec![])),
+            stats: Stats::default(),
+        };
+        let tls = Arc::new(tls::Tls::load(&config).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let slots = Arc::new(Semaphore::new(0));
+        let mut forward = Box::pin(proxy.handle(&config, stream, Some(slots.clone()), tls));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(forward.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        slots.add_permits(1);
+        let device = async {
+            client.write_all(b"ping").await.unwrap();
+            let mut reply = [0; 4];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"ping");
+            assert_eq!(slots.available_permits(), 1);
+            client.shutdown().await.unwrap();
+        };
+        let workload = async {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut message = [0; 4];
+            stream.read_exact(&mut message).await.unwrap();
+            stream.write_all(&message).await.unwrap();
+            stream.shutdown().await.unwrap();
+        };
+        let (result, (), ()) = timeout(Duration::from_secs(1), async {
+            tokio::join!(forward, device, workload)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_setup_expires_without_consuming_a_later_slot() {
+        let config = Config {
+            handshake_timeout_ms: 10,
+            ..Config::default()
+        };
+        let proxy = Proxy {
+            pool: Arc::new(Pool::from_config(&config)),
+            http: Arc::new(http1::State::new(config.http1.clone(), vec![])),
+            stats: Stats::default(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let slots = Arc::new(Semaphore::new(0));
+        let error = timeout(
+            Duration::from_secs(1),
+            proxy.handle(
+                &config,
+                stream,
+                Some(slots.clone()),
+                Arc::new(tls::Tls::load(&config).unwrap()),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.to_string(), "TLS setup admission deadline elapsed");
+        slots.add_permits(1);
+        assert_eq!(slots.available_permits(), 1);
+        let mut byte = [0];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
     }
 }
 
