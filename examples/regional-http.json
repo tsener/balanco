@@ -1,0 +1,16 @@
+{
+  "listen": "127.0.0.1:8443",
+  "geoip": { "database": "GeoLite2-Country.mmdb", "max_age_days": 30 },
+  "http1": {},
+  "backends": [
+    { "address": "127.0.0.1:9001", "region": "eu", "capabilities": ["devices", "websocket"] },
+    { "address": "127.0.0.1:9002", "region": "us", "capabilities": ["devices", "websocket"] }
+  ],
+  "routing_constraints": [
+    { "match": { "country_codes": ["BG", "DE"] }, "regions": ["eu"] },
+    { "match": { "country_codes": ["US"] }, "regions": ["us"] },
+    { "match": { "country_unknown": true }, "reject": true },
+    { "match": { "path_prefix": "/devices" }, "capabilities": ["devices"] },
+    { "match": { "websocket": true }, "capabilities": ["websocket"] }
+  ]
+}

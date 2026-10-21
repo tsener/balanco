@@ -63,6 +63,7 @@ struct Channel {
     config_generation: u64,
 }
 struct State {
+    constraints: Arc<Vec<crate::decision::Constraint>>,
     routing: crate::decision::State,
     channels: Vec<Channel>,
     weights: Vec<u32>,
@@ -77,8 +78,10 @@ struct State {
 }
 pub struct Pool {
     state: Mutex<State>,
+    pub geoip: std::sync::RwLock<Arc<crate::geoip::GeoIp>>,
 }
 pub struct Lease {
+    pub routing_guard: crate::decision::Guard,
     pub index: usize,
     pub backend: Backend,
     pub counters: Arc<Counters>,
@@ -128,11 +131,14 @@ impl Pool {
         state.hash_failover = config.hash_failover;
         state.outbound_bind = config.outbound_bind;
         state.upstream_tls = config.upstream_tls.is_some();
+        state.constraints = Arc::new(config.routing_constraints.clone());
         pool
     }
     pub fn new(backends: Vec<Backend>, cooldown: Duration, scheduler: Box<dyn Scheduler>) -> Self {
         Self {
+            geoip: std::sync::RwLock::new(Arc::default()),
             state: Mutex::new(State {
+                constraints: Arc::default(),
                 routing: crate::decision::State::default(),
                 scheduler,
                 weights: backends.iter().map(|b| b.weight).collect(),
@@ -161,6 +167,7 @@ impl Pool {
     pub fn reconfigure(&self, config: &crate::config::Config) {
         let mut state = self.state.lock().expect("scheduler panicked");
         state.routing.invalidate();
+        state.constraints = Arc::new(config.routing_constraints.clone());
         let old_counters: std::collections::HashMap<_, _> = state
             .channels
             .iter()
@@ -209,6 +216,7 @@ impl Pool {
                 ip: peer,
                 tls_version: None,
                 sni: None,
+                metadata: None,
             },
         )
     }
@@ -240,6 +248,9 @@ impl Pool {
         channel.counters.active.fetch_add(1, Ordering::Relaxed);
         channel.counters.total.fetch_add(1, Ordering::Relaxed);
         Some(Lease {
+            routing_guard: state
+                .routing
+                .guard(selection, state.constraints.clone(), client),
             index,
             backend: channel.backend.clone(),
             counters: channel.counters.clone(),
@@ -268,12 +279,14 @@ impl Pool {
         }
         let mut data = state.routing.status(now);
         data["backend_generation"] = state.generation.into();
+        data["geoip"] = self.geoip.read().expect("GeoIP lock poisoned").status();
         if let Operation::Preview(preview) = operation {
             crate::decision::State::validate_preview(preview)?;
             let client = Client {
                 ip: preview.client_ip,
                 tls_version: preview.tls_version.as_deref(),
                 sni: preview.sni.as_deref(),
+                metadata: Some(&preview.metadata),
             };
             let (weights, eligible, selection) = state.candidates(&[false; 256], client, now);
             data["profile"] = serde_json::json!(state.routing.profile_name(selection));
@@ -338,7 +351,8 @@ impl State {
         let mut eligible = [false; 256];
         for (i, channel) in state.channels.iter().enumerate() {
             let b = &channel.backend;
-            eligible[i] = b.weight > 0
+            eligible[i] = crate::decision::permitted(&state.constraints, b, client)
+                && b.weight > 0
                 && weights[i] > 0
                 && !channel.disabled
                 && !attempted[i]
@@ -418,7 +432,7 @@ impl Pool {
                 for c in &state.channels {
                     let b = &c.backend;
                     let n = numbers.entry(b.priority).or_default();
-                    rows.push(json!({"group":b.priority,"channel":*n,"address":b.address,"server_name":b.server_name,"enabled":!c.disabled,"weight":b.weight,"maxc":b.max_connections,"active":c.counters.active.load(Ordering::Relaxed),"connections":c.counters.total.load(Ordering::Relaxed),"bytes_up":c.counters.up.load(Ordering::Relaxed),"bytes_down":c.counters.down.load(Ordering::Relaxed),"mode":if state.hash_groups.contains(&b.priority){"hash"}else{"rr"},"cooling_down":c.failed_until>Instant::now()}));
+                    rows.push(json!({"group":b.priority,"channel":*n,"address":b.address,"server_name":b.server_name,"region":b.region,"capabilities":b.capabilities,"enabled":!c.disabled,"weight":b.weight,"maxc":b.max_connections,"active":c.counters.active.load(Ordering::Relaxed),"connections":c.counters.total.load(Ordering::Relaxed),"bytes_up":c.counters.up.load(Ordering::Relaxed),"bytes_down":c.counters.down.load(Ordering::Relaxed),"mode":if state.hash_groups.contains(&b.priority){"hash"}else{"rr"},"cooling_down":c.failed_until>Instant::now()}));
                     *n += 1;
                 }
                 rows.sort_by_key(|r| (r["group"].as_u64(),r["channel"].as_u64()));
@@ -507,6 +521,61 @@ fn ip_hash(ip: IpAddr) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn placement_constraints_survive_external_expiry_and_backend_failover() {
+        use crate::{
+            config::Config,
+            decision::{Client, Metadata, Operation},
+        };
+        let config: Config = serde_json::from_value(serde_json::json!({"backends":[
+            {"address":"127.0.0.1:9001","region":"eu","capabilities":["devices"]},
+            {"address":"127.0.0.1:9002","region":"us","capabilities":["devices"]}],
+            "routing_constraints":[{"match":{},"regions":["eu"],"capabilities":["devices"]},
+                {"match":{"country_unknown":true},"reject":true}]
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        let pool = Pool::from_config(&config);
+        let data = Metadata {
+            country: Some("BG".into()),
+            ..Default::default()
+        };
+        let client = Client {
+            ip: "8.8.8.8".parse().unwrap(),
+            tls_version: None,
+            sni: None,
+            metadata: Some(&data),
+        };
+        assert!(
+            pool.acquire_for_context(
+                &[false; 2],
+                Client {
+                    metadata: None,
+                    ..client
+                }
+            )
+            .is_none()
+        );
+        let update=serde_json::from_value(serde_json::json!({"expected_generation":0,"backend_generation":0,"ttl_ms":100,"source_revision":"placement","on_expiry":"configured",
+            "profiles":{"default":{"weights":{"127.0.0.1:9002":1000}}}})).unwrap();
+        pool.routing(&Operation::Apply(update)).unwrap();
+        assert!(pool.acquire_for_context(&[false; 2], client).is_none());
+        // Expire the snapshot without wall-clock sleeps, then verify configured fallback stays in-region.
+        let mut state = pool.state.lock().unwrap();
+        let (_, eligible, _) = state.candidates(
+            &[false; 2],
+            client,
+            Instant::now() + Duration::from_millis(101),
+        );
+        assert_eq!(&eligible[..2], &[true, false]);
+        state.routing.invalidate();
+        drop(state);
+        let lease = pool.acquire_for_context(&[false; 2], client).unwrap();
+        assert_eq!(lease.index, 0);
+        pool.failed(0, lease.config_generation, lease.health_epoch);
+        drop(lease);
+        assert!(pool.acquire_for_context(&[false; 2], client).is_none());
+    }
     use super::*;
     #[test]
     fn hash_affinity_and_failover_policy() {
@@ -699,6 +768,7 @@ mod tests {
             client_ip: "127.0.0.1".parse().unwrap(),
             tls_version: None,
             sni: None,
+            metadata: Default::default(),
         });
         let before = pool.routing(&preview).unwrap();
         assert_eq!(before.data["candidates"][0]["eligible"], false);

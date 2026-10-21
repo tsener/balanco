@@ -289,6 +289,8 @@ fn channel(token: &str, default_port: u16, priority: u16) -> Result<Backend, Err
         priority,
         max_connections,
         server_name: None,
+        region: None,
+        capabilities: vec![],
     })
 }
 

@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod control;
 mod decision;
+mod geoip;
 mod http1;
 mod scheduler;
 mod tls;
@@ -90,11 +91,23 @@ struct Proxy {
     http: Arc<http1::State>,
     stats: Stats,
 }
+#[derive(Clone)]
 struct ClientInfo {
     peer: std::net::SocketAddr,
     destination: std::net::SocketAddr,
     sni: Option<String>,
     tls_version: Option<&'static str>,
+    metadata: decision::Metadata,
+}
+impl ClientInfo {
+    fn context(&self) -> decision::Client<'_> {
+        decision::Client {
+            ip: self.peer.ip(),
+            tls_version: self.tls_version,
+            sni: self.sni.as_deref(),
+            metadata: Some(&self.metadata),
+        }
+    }
 }
 impl Proxy {
     // Spawned by run; complete frontend TLS before selecting a backend.
@@ -112,6 +125,10 @@ impl Proxy {
             destination,
             sni: None,
             tls_version: None,
+            metadata: decision::Metadata {
+                country: tls.geoip.country(peer.ip()),
+                ..Default::default()
+            },
         };
         stream.set_nodelay(true)?;
         match &tls.acceptor {
@@ -122,6 +139,21 @@ impl Proxy {
                 )
                 .await??;
                 info.sni = stream.get_ref().1.server_name().map(str::to_owned);
+                info.metadata.tls_cipher = stream
+                    .get_ref()
+                    .1
+                    .negotiated_cipher_suite()
+                    .map(|s| format!("{:?}", s.suite()));
+                info.metadata.alpn = stream
+                    .get_ref()
+                    .1
+                    .alpn_protocol()
+                    .map(|v| String::from_utf8_lossy(v).into_owned());
+                info.metadata.client_verified = stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .is_some_and(|c| !c.is_empty());
                 info.tls_version = match stream.get_ref().1.protocol_version() {
                     Some(tokio_rustls::rustls::ProtocolVersion::TLSv1_2) => Some("TLS1.2"),
                     Some(tokio_rustls::rustls::ProtocolVersion::TLSv1_3) => Some("TLS1.3"),
@@ -141,19 +173,44 @@ impl Proxy {
         tls: &tls::Tls,
         info: ClientInfo,
     ) -> Result<(), Error> {
+        if config.http1.is_some() {
+            let (up, down) = http1::relay(
+                client,
+                info.clone(),
+                config,
+                self.http.clone(),
+                |metadata| async move {
+                    let mut info = info;
+                    info.metadata.http = Some(metadata);
+                    let result = self.establish(config, tls, &info).await;
+                    drop(setup);
+                    result
+                },
+            )
+            .await?;
+            self.stats.up.fetch_add(up, Ordering::Relaxed);
+            self.stats.down.fetch_add(down, Ordering::Relaxed);
+            return Ok(());
+        }
+        let (upstream, lease) = self.establish(config, tls, &info).await?;
+        drop(setup);
+        let result = self.forward(config, client, upstream, &lease).await;
+        drop(lease);
+        result
+    }
+
+    async fn establish(
+        &self,
+        config: &Config,
+        tls: &tls::Tls,
+        info: &ClientInfo,
+    ) -> Result<(Upstream, scheduler::Lease), Error> {
         let peer = info.peer;
         let mut attempted = [false; 256];
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(config.establishment_timeout_ms);
         let mut last_error: Error = "no eligible backend".into();
-        while let Some(lease) = self.pool.acquire_for_context(
-            &attempted,
-            decision::Client {
-                ip: peer.ip(),
-                tls_version: info.tls_version,
-                sni: info.sni.as_deref(),
-            },
-        ) {
+        while let Some(lease) = self.pool.acquire_for_context(&attempted, info.context()) {
             let i = lease.index;
             attempted[i] = true;
             let attempt_deadline = deadline.min(
@@ -206,21 +263,10 @@ impl Proxy {
             match connection {
                 Ok(Ok(upstream)) => {
                     self.pool.succeeded(i, lease.config_generation);
-                    drop(setup);
                     if config.debug {
                         eprintln!("client {peer} connected to {}", lease.backend.address);
                     }
-                    let result = match upstream {
-                        Upstream::Tcp(stream) => {
-                            self.forward(config, client, stream, &lease, info).await
-                        }
-                        Upstream::Tls(stream) => {
-                            self.forward(config, client, stream, &lease, info).await
-                        }
-                    };
-                    // The lease stays alive through transfer. Never retry after application bytes may have been sent.
-                    drop(lease);
-                    return result;
+                    return Ok((upstream, lease));
                 }
                 Ok(Err(error)) => last_error = format!("{failure_phase}: {error}").into(),
                 Err(error) => last_error = format!("{failure_phase}: {error}").into(),
@@ -241,7 +287,7 @@ impl Proxy {
         }
         Err(last_error)
     }
-    // Called after establishment; choose the HTTP adapter or raw TCP relay.
+    // Called by relay for non-HTTP listeners; retain the backend lease through the raw transfer.
     async fn forward<
         A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
         B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -251,34 +297,16 @@ impl Proxy {
         mut a: A,
         mut b: B,
         lease: &scheduler::Lease,
-        info: ClientInfo,
     ) -> Result<(), Error> {
-        let (up, down) = if config.http1.is_some() {
-            http1::relay(
-                a,
-                b,
-                http1::Connection {
-                    peer: info.peer,
-                    backend: lease.backend.address,
-                    tls: config.tls.is_some(),
-                    sni: info.sni,
-                },
-                config,
-                self.http.clone(),
-                lease.counters.clone(),
-            )
-            .await?
-        } else {
-            transport::copy(
-                &mut a,
-                &mut b,
-                config.buffer_bytes,
-                config.idle_timeout_ms,
-                config.packet_dump,
-                &lease.counters,
-            )
-            .await?
-        };
+        let (up, down) = transport::copy(
+            &mut a,
+            &mut b,
+            config.buffer_bytes,
+            config.idle_timeout_ms,
+            config.packet_dump,
+            &lease.counters,
+        )
+        .await?;
         self.stats.up.fetch_add(up, Ordering::Relaxed);
         self.stats.down.fetch_add(down, Ordering::Relaxed);
         Ok(())
@@ -321,6 +349,48 @@ enum Upstream {
     Tcp(TcpStream),
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
+impl AsyncRead for Upstream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+impl AsyncWrite for Upstream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Self::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 // Called by start; supervise admission, reload publication and graceful drain.
 async fn run(config: Config, tls: tls::Tls) -> Result<(), Error> {
@@ -333,6 +403,7 @@ async fn run(config: Config, tls: tls::Tls) -> Result<(), Error> {
     let capacity = Arc::new(Semaphore::new(initial.max_connections));
     let handshakes = Arc::new(Semaphore::new(initial.max_handshakes));
     let pool = Arc::new(Pool::from_config(&initial));
+    *pool.geoip.write().expect("GeoIP lock poisoned") = tls.geoip.clone();
     // Register trusted, compiled HttpPlugin implementations after the bundled header rules.
     let http = Arc::new(http1::State::new(initial.http1.clone(), vec![]));
     let shutdown = Arc::new(Notify::new());
@@ -399,6 +470,7 @@ async fn run(config: Config, tls: tls::Tls) -> Result<(), Error> {
                             match bind_listener_if_changed(&listener, next_config.listen, next_config.reuse_port) {
                                 Ok(next_listener) => {
                                     proxy.pool.reconfigure(&next_config);
+                                    *proxy.pool.geoip.write().expect("GeoIP lock poisoned") = next_tls.geoip.clone();
                                     proxy.http.reload(next_config.http1.clone());
                                     *config.write().expect("config lock poisoned") = next_config;
                                     tls = Arc::new(next_tls);

@@ -14,6 +14,8 @@
 
 Smooth weighted round-robin, priority failover and client-IP hashing select backends. Local `-i`/`-c` administration and a separate mTLS management API expose live controls. SNI certificates, PROXY v2, validated SIGHUP reloads and hybrid X25519 + ML-KEM-768 key exchange are supported.
 
+Optional local GeoIP and first-request HTTP/WebSocket metadata steer regional backend selection. A separate Rust controller translates typed Jev/Laya choices into approved weight policies; region/capability restrictions stay under operator control.
+
 ## Build and run
 
 Linux or macOS; Rust 1.90+, a C compiler and CMake for AWS-LC. On Debian/Ubuntu, install `build-essential cmake` first.
@@ -44,6 +46,7 @@ Start with [TCP](examples/tcp.json), [two-leg mTLS](examples/mtls.json), [HTTP h
 - [Architecture and code call flow](docs/architecture.md)
 - [Deployment and UML diagrams](docs/diagrams.md)
 - [External weight decisions and routing API](docs/routing-api.md)
+- [Jev/Laya routing controller](docs/routing-controller.md)
 
 **Status:** early software, not a production-capacity guarantee. TLS 1.2/1.3 only; no TLS 1.0/1.1, HTTP/2/3, OCSP stapling, embedded ACME client or dynamic plugin loader. HTTP hooks act on headers, not WebSocket payloads. CI produces a Linux x86-64 build; static and cross-architecture packaging are separate work.
 

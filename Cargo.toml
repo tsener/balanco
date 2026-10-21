@@ -3,6 +3,7 @@ name = "balanco"
 version = "0.1.0"
 edition = "2024"
 description = "A bounded TCP/TLS load balancer for long-lived connections"
+default-run = "balanco"
 
 [dependencies]
 tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "signal", "macros"] }
@@ -13,6 +14,7 @@ httparse = "1"
 libc = "0.2"
 hyper = { version = "1.12", default-features = false, features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+maxminddb = { version = "0.30", default-features = false }
 
 [profile.release]
 lto = "thin"

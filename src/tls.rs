@@ -13,6 +13,7 @@ use tokio_rustls::{
 };
 
 pub struct Tls {
+    pub geoip: Arc<crate::geoip::GeoIp>,
     pub acceptor: Option<TlsAcceptor>,
     pub connector: Option<TlsConnector>,
     pub management: Option<ManagementTls>,
@@ -196,6 +197,7 @@ impl Tls {
             })
             .transpose()?;
         Ok(Self {
+            geoip: Arc::new(crate::geoip::GeoIp::load(config.geoip.as_ref())?),
             acceptor,
             connector,
             management,

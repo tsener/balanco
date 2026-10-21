@@ -507,6 +507,8 @@ pub async fn execute(pool: &Pool, request: &Request, role: Role) -> (Reply, u16)
                 priority: request.group,
                 max_connections: 0,
                 server_name,
+                region: None,
+                capabilities: vec![],
             })
         } else {
             None

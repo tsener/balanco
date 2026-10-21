@@ -19,7 +19,7 @@ Use `balanco --help` for Balance-style arguments, or `--config FILE` for JSON. U
 
 Excess connections/setups are rejected rather than queued inside the application. Ordinarily each session needs two sockets; size file descriptors, TLS state and kernel buffers as well as relay memory. Numeric validation ceilings are not capacity guarantees. JSON backend addresses are numeric; positional CLI names resolve at startup without periodic DNS refresh.
 
-Each backend supports `address`, `weight` (default 1; zero disables assignments), `priority` (smaller values first), and `max_connections` (zero means no additional cap). Set `server_name` on every backend when upstream TLS is enabled. An established session stays with its backend for its lifetime.
+Each backend supports `address`, `weight` (default 1; zero disables assignments), `priority` (smaller values first), and `max_connections` (zero means no additional cap). Optional `region` and `capabilities` supply operator-defined placement metadata. Set `server_name` on every backend when upstream TLS is enabled. An established session stays with its backend for its lifetime. See the [routing API](routing-api.md) for GeoIP, HTTP/WebSocket selection and configuration-only placement constraints.
 
 Balanco requests a 16,384-entry listener backlog, capped on Linux by `net.core.somaxconn`. The measured reconnect comparison used `somaxconn=16384`, `tcp_max_syn_backlog=16384`, SYN cookies enabled, `max_connections=20000` and `max_handshakes=8192`. These are tested settings, not universal defaults. Monitor setup rejections, SYN cookies, listener drops, retransmissions and memory together. Devices should use reconnect backoff with jitter.
 

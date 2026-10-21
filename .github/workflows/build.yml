@@ -86,7 +86,7 @@ jobs:
       - name: Package executable and corresponding source
         run: |
           mkdir dist
-          cp target/release/balanco LICENSE dist/
+          cp target/release/balanco target/release/balanco-controller LICENSE dist/
           git archive --format=tar.gz --output=dist/balanco-source.tar.gz HEAD
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

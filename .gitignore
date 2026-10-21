@@ -45,6 +45,8 @@ known_hosts
 /certs/
 /certificates/
 /config.local.*
+/*.local.json
+*.mmdb
 
 # Raw captures, logs and generated packages
 *.pcap

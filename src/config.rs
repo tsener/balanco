@@ -39,6 +39,8 @@ pub struct Config {
     pub control_socket: Option<std::path::PathBuf>,
     pub management: Option<Management>,
     pub http1: Option<std::sync::Arc<balanco::http_plugin::HttpConfig>>,
+    pub geoip: Option<crate::geoip::Config>,
+    pub routing_constraints: Vec<crate::decision::Constraint>,
     #[serde(skip)]
     pub config_file: Option<std::path::PathBuf>,
 }
@@ -71,6 +73,8 @@ impl Default for Config {
             control_socket: None,
             management: None,
             http1: None,
+            geoip: None,
+            routing_constraints: vec![],
             config_file: None,
         }
     }
@@ -88,6 +92,10 @@ pub struct Backend {
     #[serde(default)]
     pub max_connections: usize,
     pub server_name: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 fn one() -> u32 {
     1
@@ -183,6 +191,38 @@ impl Config {
 
     // Called by load and positional CLI parsing; reject inconsistent settings before use.
     pub fn validate(&self) -> Result<(), Error> {
+        if self.routing_constraints.len() > 128 {
+            return Err("too many routing constraints".into());
+        }
+        for c in &self.routing_constraints {
+            crate::decision::validate_match(&c.matcher)?;
+            if (!c.reject && c.regions.is_empty() && c.capabilities.is_empty())
+                || c.regions.len() > 64
+                || c.capabilities.len() > 32
+                || c.regions.iter().chain(&c.capabilities).any(|v| {
+                    v.is_empty()
+                        || v.len() > 64
+                        || !v
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                })
+            {
+                return Err("invalid routing constraint".into());
+            }
+        }
+        for b in &self.backends {
+            if b.capabilities.len() > 32
+                || b.capabilities.iter().chain(b.region.iter()).any(|v| {
+                    v.is_empty()
+                        || v.len() > 64
+                        || !v
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+                })
+            {
+                return Err("invalid backend region or capability".into());
+            }
+        }
         if let Some(http) = &self.http1 {
             http.validate()?;
         }
