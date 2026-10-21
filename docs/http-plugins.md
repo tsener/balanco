@@ -71,4 +71,4 @@ HTTP defaults are 16,384 header bytes (range 8,192–65,536), 64 fields, a 5-sec
 
 Policies have at most 128 rules and a 12,288-byte serialized rule budget; individual values/templates are limited to 4,096 bytes. The existing management request limit is 16,384 bytes. HTTP connection settings are captured on acceptance; rules can change per request. Rule/runtime errors terminate the connection and do not trigger request replay.
 
-Run `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` and `cargo run --locked --example header_plugin`. Inline Rust unit checks remain with their source modules; standalone integration tests and private benchmark tooling are not published. See [the measured HTTP/WebSocket workloads and their limits](benchmarks.md).
+Run `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` and `cargo run --locked --example header_plugin`. Inline Rust unit checks remain with their source modules; standalone integration tests and private benchmark tooling are not published.

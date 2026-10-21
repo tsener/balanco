@@ -35,19 +35,12 @@ The sample forwards port 8080 to your services on ports 9001/9002, with 9003 as 
 
 Start with [TCP](examples/tcp.json), [two-leg mTLS](examples/mtls.json), [HTTP headers](examples/http1.json) or [management API](examples/management.json). TLS examples contain placeholder paths; supply your own certificates and keys.
 
-## Measured on two cores
-
-With frontend mTLS and header rules enabled, the latest three-run medians were **17,233 HTTP requests/s**, **18,065 WebSocket messages/s**, and **2,516 new connections/s** in a 5,000-device reconnect burst alongside 1,000 active devices. Balanco completed **30,000/30,000 reconnects** across the final rules-on/off matrix, retaining every existing session.
-
-In these workloads, Balanco used less CPU and process memory than NGINX and Hitch + Varnish. Results are specific to the tested VM/network; storm tail latency remains a tuning target. See [loads, methodology, p99, CPU, memory and comparisons](docs/benchmarks.md), including separate Hitch TLS/hybrid-PQ measurements.
-
 ## Documentation
 
 - [Operations, TLS, reloads and live administration](docs/operations.md)
 - [HTTP header rules and compiled plugin API](docs/http-plugins.md)
 - [Architecture and code call flow](docs/architecture.md)
-- [Benchmark results and limitations](docs/benchmarks.md)
 
-**Status:** early software with measured workloads, not a production-capacity guarantee. TLS 1.2/1.3 only; no TLS 1.0/1.1, HTTP/2/3, OCSP stapling, embedded ACME client or dynamic plugin loader. HTTP hooks act on headers, not WebSocket payloads. CI produces a Linux x86-64 build; static and cross-architecture packaging are separate work.
+**Status:** early software, not a production-capacity guarantee. TLS 1.2/1.3 only; no TLS 1.0/1.1, HTTP/2/3, OCSP stapling, embedded ACME client or dynamic plugin loader. HTTP hooks act on headers, not WebSocket payloads. CI produces a Linux x86-64 build; static and cross-architecture packaging are separate work.
 
 Licensed under [GPLv3](LICENSE). Inspired by Balance's CLI and routing model; the original C implementation is not included.
