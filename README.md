@@ -20,9 +20,38 @@ Smooth weighted round-robin, priority failover and client-IP hashing select back
 
 Optional local GeoIP and first-request HTTP/WebSocket metadata steer regional backend selection. A separate Rust controller translates typed Jev/Laya choices into approved weight policies; region/capability restrictions stay under operator control.
 
-## Build and run
+## Install and run
 
-Container builds, GHCR publishing, static Linux release binaries and a Kubernetes gateway bundle are described in the [deployment guide](deploy/README.md). The Kubernetes bundle runs Balanco as an edge proxy; Kubernetes Ingress resource reconciliation is not implemented.
+### Docker
+
+The image contains statically linked Linux AMD64 executables and runs as a non-root user:
+
+```sh
+docker pull ghcr.io/tsener/balanco:v0.1.0
+docker run --rm ghcr.io/tsener/balanco:v0.1.0 --version
+```
+
+To serve traffic, mount your configuration and certificates, provide a writable runtime directory, and publish the configured listener port. See the [container and Kubernetes deployment guide](deploy/README.md) for a complete example. Kubernetes Ingress resource reconciliation is not implemented.
+
+### Linux binary
+
+Download [v0.1.0](https://github.com/tsener/balanco/releases/tag/v0.1.0) for Linux x86-64. The archive includes `balanco`, `balanco-controller` and the license; no Rust runtime or shared libraries are required. Download the corresponding source archive too, then verify both before extracting:
+
+```sh
+release_url=https://github.com/tsener/balanco/releases/download/v0.1.0
+curl -fLO "$release_url/balanco-linux-amd64-musl.tar.gz"
+curl -fLO "$release_url/balanco-source.tar.gz"
+curl -fLO "$release_url/SHA256SUMS"
+sha256sum --check SHA256SUMS && \
+  tar -xzf balanco-linux-amd64-musl.tar.gz && \
+  ./balanco --version
+```
+
+Supply your configuration with `./balanco --config /absolute/path/balanco.json`. Native macOS and ARM64 release binaries are not included.
+
+### Build from source
+
+Container builds, GHCR publishing and a Kubernetes gateway bundle are described in the [deployment guide](deploy/README.md).
 
 Linux or macOS; Rust 1.90+, a C compiler and CMake for AWS-LC. On Debian/Ubuntu, install `build-essential cmake` first.
 
