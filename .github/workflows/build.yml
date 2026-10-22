@@ -131,6 +131,7 @@ jobs:
           /tmp/kubectl kustomize deploy/kubernetes > /tmp/balanco-kubernetes.yaml
       - name: Verify image and package binaries
         run: |
+          command -v readelf
           docker run --rm --network none --read-only --cap-drop ALL balanco:build --version
           docker run --rm --network none --read-only --cap-drop ALL \
             -v "$PWD/examples:/examples:ro" balanco:build --config /examples/tcp.json --check
@@ -160,8 +161,10 @@ jobs:
           docker cp "$container_id:/bin/balanco-controller" package/balanco-controller
           cp LICENSE package/
           for binary in package/balanco package/balanco-controller; do
-            if readelf -l "$binary" | grep -q interpreter; then exit 1; fi
-            if readelf -d "$binary" | grep -q NEEDED; then exit 1; fi
+            readelf -l "$binary" > /tmp/balanco-program-headers
+            readelf -d "$binary" > /tmp/balanco-dynamic-section
+            if grep -q interpreter /tmp/balanco-program-headers; then exit 1; fi
+            if grep -q NEEDED /tmp/balanco-dynamic-section; then exit 1; fi
           done
           package/balanco --version
           package/balanco --config examples/http1.json --check
