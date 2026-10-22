@@ -135,13 +135,6 @@ jobs:
           PY
       - name: Verify native runner
         run: test "$(uname -m)" = "$MACHINE"
-      - name: ARM64 native unit checks
-        if: matrix.arch == 'arm64'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends build-essential cmake openssl
-          rustup toolchain install 1.90.0 --profile minimal
-          cargo +1.90.0 test --locked --all-targets
       - name: Build static image
         run: |
           docker build --platform "linux/$ARCH" --file deploy/container/Dockerfile \

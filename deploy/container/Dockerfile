@@ -1,5 +1,5 @@
 FROM rust:1.90-alpine AS build
-RUN apk add --no-cache build-base cmake perl linux-headers binutils
+RUN apk add --no-cache build-base cmake perl linux-headers binutils openssl
 WORKDIR /work
 COPY Cargo.toml Cargo.lock LICENSE .dockerignore ./
 COPY src ./src
@@ -12,6 +12,7 @@ RUN set -eu; \
       aarch64) target=aarch64-unknown-linux-musl ;; \
       *) echo "Unsupported build architecture" >&2; exit 1 ;; \
     esac; \
+    cargo test --locked --all-targets --target "$target"; \
     cargo build --locked --release --bins --target "$target"; \
     mkdir -p /out /runtime/run/balanco; \
     cp "target/$target/release/balanco" "target/$target/release/balanco-controller" /out/; \
