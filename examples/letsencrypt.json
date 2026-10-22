@@ -1,0 +1,15 @@
+{
+  "listen": "0.0.0.0:443",
+  "workers": 2,
+  "control_socket": "/run/balanco/control.sock",
+  "tls": {
+    "cert": "/etc/letsencrypt/live/devices.example.com/fullchain.pem",
+    "key": "/etc/letsencrypt/live/devices.example.com/privkey.pem",
+    "client_ca": "/etc/balanco/device-ca.pem",
+    "key_exchange": "hybrid_preferred"
+  },
+  "backends": [
+    { "address": "127.0.0.1:9001", "weight": 1 },
+    { "address": "127.0.0.1:9002", "weight": 1 }
+  ]
+}

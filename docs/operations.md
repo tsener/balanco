@@ -33,7 +33,7 @@ TLS supports 1.2/1.3 through rustls/AWS-LC. Each TLS block accepts `key_exchange
 
 Add `tls.sni_certificates` entries with `names`, `cert`, `key` for exact names or one-label wildcards such as `*.devices.example`. Top-level `cert`/`key` remain the no-SNI fallback. Unknown SNI also falls back unless `reject_unknown_sni` is true. TLS 1.0/1.1 and automatic OCSP stapling are unavailable.
 
-Certificate paths are relative to the process working directory; prefer absolute paths. Use an external ACME issuer, cert-manager or DNS-01 automation (including Cloudflare tooling) to issue and renew certificates. Balanco has no embedded issuer or provider credentials. Publish a complete versioned bundle atomically, then send SIGHUP. Established sessions keep their previous trust decision.
+Certificate paths are relative to the process working directory; prefer absolute paths. Use an external ACME issuer, cert-manager or DNS-01 automation (including Cloudflare tooling) to issue and renew certificates. See the [Certbot integration](acme.md) for DNS-01/HTTP-01 issuance, key permissions and a validated systemd deploy hook. Balanco has no embedded issuer or provider credentials. Publish a complete versioned bundle atomically, then send SIGHUP. Established sessions keep their previous trust decision.
 
 ## Reload and shutdown
 

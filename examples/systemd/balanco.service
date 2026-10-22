@@ -1,0 +1,31 @@
+[Unit]
+Description=Balanco TCP and mTLS load balancer
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=balanco
+Group=balanco
+WorkingDirectory=/etc/balanco
+RuntimeDirectory=balanco
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/local/bin/balanco --config /etc/balanco/balanco.json --check
+ExecStart=/usr/local/bin/balanco --config /etc/balanco/balanco.json
+# Certbot calls reload after renewal; validate as the service user before signalling.
+ExecReload=/usr/local/bin/balanco --config /etc/balanco/balanco.json --check
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+# Exceeds the default 30-second graceful drain deadline.
+TimeoutStopSec=40s
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

@@ -46,6 +46,7 @@ Start with [TCP](examples/tcp.json), [two-leg mTLS](examples/mtls.json), [HTTP h
 ## Documentation
 
 - [Operations, TLS, reloads and live administration](docs/operations.md)
+- [Let's Encrypt/Certbot renewal and systemd deployment](docs/acme.md)
 - [HTTP header rules and compiled plugin API](docs/http-plugins.md)
 - [Architecture and code call flow](docs/architecture.md)
 - [Deployment and UML diagrams](docs/diagrams.md)
