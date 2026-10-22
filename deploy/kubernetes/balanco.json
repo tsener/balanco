@@ -1,0 +1,15 @@
+{
+  "listen": "0.0.0.0:8443",
+  "workers": 2,
+  "control_socket": "/run/balanco/control.sock",
+  "drain_timeout_ms": 30000,
+  "tls": {
+    "cert": "/etc/balanco/tls/tls.crt",
+    "key": "/etc/balanco/tls/tls.key",
+    "client_ca": "/etc/balanco/tls/client-ca.crt",
+    "key_exchange": "hybrid_preferred"
+  },
+  "backends": [
+    { "address": "192.0.2.10:9000", "weight": 1 }
+  ]
+}

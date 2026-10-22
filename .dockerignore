@@ -1,0 +1,19 @@
+# Only build inputs enter the context; deployment credentials and private tests stay out.
+**
+!Cargo.toml
+!Cargo.lock
+!LICENSE
+!.dockerignore
+!src/
+!src/**
+!examples/
+!examples/**
+!deploy/
+!deploy/container/
+!deploy/container/Dockerfile
+**/* 2.rs
+**/*.pem
+**/*.key
+**/*.crt
+**/*.mmdb
+**/*.local.*

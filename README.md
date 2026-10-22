@@ -22,6 +22,8 @@ Optional local GeoIP and first-request HTTP/WebSocket metadata steer regional ba
 
 ## Build and run
 
+Container builds, GHCR publishing, static Linux release binaries and a Kubernetes gateway bundle are described in the [deployment guide](deploy/README.md). The Kubernetes bundle runs Balanco as an edge proxy; Kubernetes Ingress resource reconciliation is not implemented.
+
 Linux or macOS; Rust 1.90+, a C compiler and CMake for AWS-LC. On Debian/Ubuntu, install `build-essential cmake` first.
 
 Inline Rust tests additionally require the OpenSSL command-line tool to generate temporary test certificates; no credentials are bundled in the repository.
@@ -53,6 +55,6 @@ Start with [TCP](examples/tcp.json), [two-leg mTLS](examples/mtls.json), [HTTP h
 - [External weight decisions and routing API](docs/routing-api.md)
 - [Jev/Laya routing controller](docs/routing-controller.md)
 
-**Status:** early software, not a production-capacity guarantee. TLS 1.2/1.3 only; no TLS 1.0/1.1, HTTP/2/3, OCSP stapling, embedded ACME client or dynamic plugin loader. HTTP hooks act on headers, not WebSocket payloads. CI produces a Linux x86-64 build; static and cross-architecture packaging are separate work.
+**Status:** early software, not a production-capacity guarantee. TLS 1.2/1.3 only; no TLS 1.0/1.1, HTTP/2/3, OCSP stapling, embedded ACME client or dynamic plugin loader. HTTP hooks act on headers, not WebSocket payloads. CI builds Linux x86-64 binaries and a static musl container; cross-architecture packaging and a Kubernetes resource controller are separate work.
 
 Licensed under [GPLv3](LICENSE). Inspired by Balance's CLI and routing model; the original C implementation is not included.

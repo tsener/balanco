@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: balanco
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: balanco
+  template:
+    metadata:
+      labels:
+        app: balanco
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        kubernetes.io/os: linux
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: balanco
+          # Replace with a verified release image digest before deployment.
+          image: ghcr.io/tsener/balanco:main
+          imagePullPolicy: Always
+          args: ["--config", "/etc/balanco/config/balanco.json"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            # The image-owned socket directory resets on container restart.
+            # An emptyDir would retain a stale socket after SIGKILL/OOM.
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "2"
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+          ports:
+            - name: tls
+              containerPort: 8443
+          startupProbe:
+            exec:
+              command: ["/bin/balanco", "--config", "/etc/balanco/config/balanco.json", "-c", "show"]
+            periodSeconds: 2
+            timeoutSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command: ["/bin/balanco", "--config", "/etc/balanco/config/balanco.json", "-c", "show"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/balanco/config
+              readOnly: true
+            - name: tls
+              mountPath: /etc/balanco/tls
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: balanco-config
+        - name: tls
+          secret:
+            secretName: balanco-tls
+            defaultMode: 0440

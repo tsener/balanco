@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: balanco
+spec:
+  type: LoadBalancer
+  # Preserve source IP for GeoIP and client-IP policies where the LB supports it.
+  externalTrafficPolicy: Local
+  selector:
+    app: balanco
+  ports:
+    - name: tls
+      port: 443
+      targetPort: tls
+      protocol: TCP
