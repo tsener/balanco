@@ -5,6 +5,8 @@ mod control;
 mod decision;
 mod geoip;
 mod http1;
+mod ingress;
+mod ingress_api;
 mod scheduler;
 mod tls;
 mod transport;
@@ -87,6 +89,7 @@ impl Stats {
     }
 }
 struct Proxy {
+    ingress: Option<Arc<ingress::State>>,
     pool: Arc<Pool>,
     http: Arc<http1::State>,
     stats: Stats,
@@ -118,6 +121,10 @@ impl Proxy {
         handshakes: Option<Arc<Semaphore>>,
         tls: Arc<tls::Tls>,
     ) -> Result<(), Error> {
+        let tls = self
+            .ingress
+            .as_ref()
+            .map_or(tls.clone(), |state| state.tls());
         let deadline = Instant::now() + Duration::from_millis(config.handshake_timeout_ms);
         // Queue under the connection cap; the same deadline also bounds frontend TLS.
         let setup = match handshakes {
@@ -175,22 +182,43 @@ impl Proxy {
         &self,
         config: &Config,
         client: S,
-        setup: Option<OwnedSemaphorePermit>,
+        mut setup: Option<OwnedSemaphorePermit>,
         tls: &tls::Tls,
         info: ClientInfo,
     ) -> Result<(), Error> {
         if config.http1.is_some() {
+            let setup_slots = setup.as_ref().map(|permit| permit.semaphore().clone());
             let (up, down) = http1::relay(
                 client,
                 info.clone(),
                 config,
                 self.http.clone(),
-                |metadata| async move {
-                    let mut info = info;
-                    info.metadata.http = Some(metadata);
-                    let result = self.establish(config, tls, &info).await;
-                    drop(setup);
-                    result
+                |metadata, backend| {
+                    self.ingress
+                        .as_ref()
+                        .is_none_or(|state| state.permits(metadata, backend))
+                },
+                |metadata| {
+                    let mut info = info.clone();
+                    let setup = setup.take();
+                    let slots = setup_slots.clone();
+                    async move {
+                        // A rerouted keep-alive request must also respect the upstream TLS budget.
+                        let setup = match (setup, slots) {
+                            (None, Some(slots)) if tls.connector.is_some() => Some(
+                                timeout(
+                                    Duration::from_millis(config.handshake_timeout_ms),
+                                    slots.acquire_owned(),
+                                )
+                                .await??,
+                            ),
+                            (permit, _) => permit,
+                        };
+                        info.metadata.http = Some(metadata);
+                        let result = self.establish(config, tls, &info).await;
+                        drop(setup);
+                        result
+                    }
                 },
             )
             .await?;
@@ -212,11 +240,20 @@ impl Proxy {
         info: &ClientInfo,
     ) -> Result<(Upstream, scheduler::Lease), Error> {
         let peer = info.peer;
+        let pool = match &self.ingress {
+            Some(state) => state.select(
+                info.metadata
+                    .http
+                    .as_ref()
+                    .ok_or("missing Ingress HTTP metadata")?,
+            )?,
+            None => self.pool.clone(),
+        };
         let mut attempted = [false; 256];
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(config.establishment_timeout_ms);
         let mut last_error: Error = "no eligible backend".into();
-        while let Some(lease) = self.pool.acquire_for_context(&attempted, info.context()) {
+        while let Some(lease) = pool.acquire_for_context(&attempted, info.context()) {
             let i = lease.index;
             attempted[i] = true;
             let attempt_deadline = deadline.min(
@@ -268,7 +305,7 @@ impl Proxy {
             .await;
             match connection {
                 Ok(Ok(upstream)) => {
-                    self.pool.succeeded(i, lease.config_generation);
+                    pool.succeeded(i, lease.config_generation);
                     if config.debug {
                         eprintln!("client {peer} connected to {}", lease.backend.address);
                     }
@@ -285,8 +322,7 @@ impl Proxy {
                     attempt_started.elapsed().as_millis()
                 );
             }
-            self.pool
-                .failed(i, lease.config_generation, lease.health_epoch);
+            pool.failed(i, lease.config_generation, lease.health_epoch);
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
@@ -402,6 +438,11 @@ impl AsyncWrite for Upstream {
 async fn run(config: Config, tls: tls::Tls) -> Result<(), Error> {
     let config = Arc::new(std::sync::RwLock::new(config));
     let initial = config.read().expect("config lock poisoned").clone();
+    let ingress = if initial.ingress.is_some() {
+        Some(ingress::start(initial.clone()).await?)
+    } else {
+        None
+    };
     let mut listener = bind_listener(initial.listen, initial.reuse_port)?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -435,6 +476,7 @@ async fn run(config: Config, tls: tls::Tls) -> Result<(), Error> {
         tls.connector.is_some()
     );
     let proxy = Arc::new(Proxy {
+        ingress,
         pool,
         http,
         stats: Stats::default(),
@@ -614,6 +656,9 @@ fn bind_listener_if_changed(
 
 // Called before publishing a reload; reject settings whose resources require a restart.
 fn reload_compatible(active: &Config, next: &Config) -> Result<(), Error> {
+    if active.ingress.is_some() || next.ingress.is_some() {
+        return Err("Ingress mode is managed by Kubernetes watches; base configuration changes require restart".into());
+    }
     if active.workers != next.workers
         || active.reuse_port != next.reuse_port
         || active.max_connections != next.max_connections
@@ -696,6 +741,7 @@ mod admission_tests {
         }))
         .unwrap();
         let proxy = Proxy {
+            ingress: None,
             pool: Arc::new(Pool::from_config(&config)),
             http: Arc::new(http1::State::new(config.http1.clone(), vec![])),
             stats: Stats::default(),
@@ -746,6 +792,7 @@ mod admission_tests {
             ..Config::default()
         };
         let proxy = Proxy {
+            ingress: None,
             pool: Arc::new(Pool::from_config(&config)),
             http: Arc::new(http1::State::new(config.http1.clone(), vec![])),
             stats: Stats::default(),

@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: devices
+  namespace: balanco-ingress
+spec:
+  ingressClassName: balanco
+  tls:
+    - hosts: [devices.example.test]
+      secretName: devices-tls
+  rules:
+    - host: devices.example.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: workload
+                port:
+                  name: web

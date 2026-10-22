@@ -52,6 +52,7 @@ struct CertificateResolver {
     exact: HashMap<String, Arc<rustls::sign::CertifiedKey>>,
     wildcard: Vec<(String, Arc<rustls::sign::CertifiedKey>)>,
     reject_unknown: bool,
+    blocked: Vec<String>,
 }
 impl rustls::server::ResolvesServerCert for CertificateResolver {
     // Called by rustls on ClientHello; prefer exact SNI, then a one-label wildcard.
@@ -63,8 +64,18 @@ impl rustls::server::ResolvesServerCert for CertificateResolver {
             return Some(self.fallback.clone());
         };
         let name = name.to_ascii_lowercase();
+        if self.blocked.iter().any(|pattern| pattern == &name) {
+            return None;
+        }
         if let Some(cert) = self.exact.get(&name) {
             return Some(cert.clone());
+        }
+        if self
+            .blocked
+            .iter()
+            .any(|pattern| crate::ingress::host_matches(pattern, &name))
+        {
+            return None;
         }
         self.wildcard
             .iter()
@@ -87,6 +98,37 @@ fn certified_key(cert: &str, key: &str) -> Result<Arc<rustls::sign::CertifiedKey
 }
 
 fn server(tls: &ServerTls) -> Result<TlsAcceptor, Error> {
+    server_with(tls, None, vec![])
+}
+
+pub type Identity = (Vec<String>, Vec<u8>, Vec<u8>);
+
+// Called by the reconciler on a blocking worker; Secret keys never touch disk.
+pub fn ingress_server(
+    tls: &ServerTls,
+    identities: Vec<Identity>,
+    blocked: Vec<String>,
+) -> Result<TlsAcceptor, Error> {
+    server_with(tls, Some(identities), blocked)
+}
+
+pub fn memory_key(cert: &[u8], key: &[u8]) -> Result<Arc<rustls::sign::CertifiedKey>, Error> {
+    let chain = CertificateDer::pem_slice_iter(cert).collect::<Result<Vec<_>, _>>()?;
+    if chain.is_empty() {
+        return Err("empty certificate chain".into());
+    }
+    let key =
+        rustls::crypto::aws_lc_rs::sign::any_supported_type(&PrivateKeyDer::from_pem_slice(key)?)?;
+    let key = rustls::sign::CertifiedKey::new(chain, key);
+    key.keys_match()?;
+    Ok(Arc::new(key))
+}
+
+fn server_with(
+    tls: &ServerTls,
+    identities: Option<Vec<Identity>>,
+    blocked: Vec<String>,
+) -> Result<TlsAcceptor, Error> {
     let provider = provider(tls.key_exchange);
     let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(versions(tls.key_exchange))?;
@@ -103,9 +145,19 @@ fn server(tls: &ServerTls) -> Result<TlsAcceptor, Error> {
     let fallback = certified_key(&tls.cert, &tls.key)?;
     let mut exact = HashMap::new();
     let mut wildcard = Vec::new();
-    for identity in &tls.sni_certificates {
-        let key = certified_key(&identity.cert, &identity.key)?;
-        for name in &identity.names {
+    let identities = match identities {
+        Some(entries) => entries
+            .into_iter()
+            .map(|(names, cert, key)| Ok((names, memory_key(&cert, &key)?)))
+            .collect::<Result<Vec<_>, Error>>()?,
+        None => tls
+            .sni_certificates
+            .iter()
+            .map(|i| Ok((i.names.clone(), certified_key(&i.cert, &i.key)?)))
+            .collect::<Result<Vec<_>, Error>>()?,
+    };
+    for (names, key) in identities {
+        for name in &names {
             let name = name.to_ascii_lowercase();
             if let Some(suffix) = name.strip_prefix("*") {
                 let probe = format!("balanco-sni-check{suffix}");
@@ -125,6 +177,7 @@ fn server(tls: &ServerTls) -> Result<TlsAcceptor, Error> {
         exact,
         wildcard,
         reject_unknown: tls.reject_unknown_sni,
+        blocked,
     });
     let mut server = builder.with_cert_resolver(resolver);
     server.max_early_data_size = 0;
@@ -206,7 +259,7 @@ impl Tls {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::{
         fs,
@@ -215,9 +268,9 @@ mod tests {
         process::{Command, Stdio},
     };
 
-    struct Certificates(PathBuf);
+    pub(crate) struct Certificates(PathBuf);
     impl Certificates {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
                 "balanco-tls-{}-{}",
@@ -300,10 +353,10 @@ mod tests {
                     .success()
             );
         }
-        fn file(&self, name: &str) -> String {
+        pub(crate) fn file(&self, name: &str) -> String {
             self.0.join(name).to_str().unwrap().into()
         }
-        fn config(&self) -> Config {
+        pub(crate) fn config(&self) -> Config {
             let server = serde_json::json!({"cert":self.file("server.pem"),"key":self.file("server.key"),"client_ca":self.file("ca.pem"),
                 "sni_certificates":[{"names":["localhost","*.devices.test"],"cert":self.file("server.pem"),"key":self.file("server.key")}],"reject_unknown_sni":true});
             let config:Config=serde_json::from_value(serde_json::json!({"backends":[{"address":"127.0.0.1:9001","server_name":"localhost"}],
@@ -514,7 +567,7 @@ mod tests {
                 let frontend=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address=frontend.local_addr().unwrap();
                 let acceptor=tls.acceptor.clone(); let connector=tls.connector.clone();
-                let proxy=crate::Proxy{pool:Arc::new(crate::scheduler::Pool::from_config(&config)),
+                let proxy=crate::Proxy{ingress:None,pool:Arc::new(crate::scheduler::Pool::from_config(&config)),
                     http:Arc::new(crate::http1::State::new(config.http1.clone(),vec![])),stats:Default::default()};
                 let workload=async {
                     let (stream,_)=backend.accept().await.unwrap();

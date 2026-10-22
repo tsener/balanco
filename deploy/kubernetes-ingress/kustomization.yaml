@@ -1,0 +1,32 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: balanco-ingress
+resources:
+  - ../kubernetes
+  - rbac.yaml
+  - ingress-class.yaml
+configMapGenerator:
+  - name: balanco-config
+    behavior: replace
+    files: [balanco.json]
+patches:
+  - target:
+      kind: Deployment
+      name: balanco
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: balanco
+      spec:
+        template:
+          spec:
+            serviceAccountName: balanco-ingress
+            automountServiceAccountToken: true
+            containers:
+              - name: balanco
+                # Requires the Ingress implementation after v0.1.1; pin your verified build.
+                image: ghcr.io/tsener/balanco:main
+                resources:
+                  requests:
+                    cpu: 500m

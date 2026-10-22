@@ -15,6 +15,7 @@
 - **WebSocket fleets:** retain established sessions while devices reconnect; transform headers during HTTP Upgrade, then tunnel bytes directly.
 - **Small proxy deployments:** two runtime workers by default, explicit connection/setup limits, bounded relay buffers, and a raw TCP path that bypasses HTTP parsing.
 - **Workload integration:** add trusted forwarding headers, rewrite Host, remove response fields, or compile custom Rust header hooks into the binary.
+- **Kubernetes Ingress (main):** watch namespace-scoped Ingresses, Services, EndpointSlices and TLS Secrets; update host/path routes and SNI identities without restarting pods.
 
 Smooth weighted round-robin, priority failover and client-IP hashing select backends. Local `-i`/`-c` administration and a separate mTLS management API expose live controls. SNI certificates, PROXY v2, validated SIGHUP reloads and hybrid X25519 + ML-KEM-768 key exchange are supported.
 
@@ -31,7 +32,7 @@ docker pull ghcr.io/tsener/balanco:v0.1.1
 docker run --rm ghcr.io/tsener/balanco:v0.1.1 --version
 ```
 
-To serve traffic, mount your configuration and certificates, provide a writable runtime directory, and publish the configured listener port. See the [container and Kubernetes deployment guide](deploy/README.md) for a complete example. Kubernetes Ingress resource reconciliation is not implemented.
+To serve traffic, mount your configuration and certificates, provide a writable runtime directory, and publish the configured listener port. See the [container and Kubernetes deployment guide](deploy/README.md), or use the [Ingress controller bundle](deploy/ingress.md) for resource reconciliation. Ingress support requires a build after v0.1.1.
 
 ### Linux binary
 
@@ -85,6 +86,6 @@ Start with [TCP](examples/tcp.json), [two-leg mTLS](examples/mtls.json), [HTTP h
 - [External weight decisions and routing API](docs/routing-api.md)
 - [Jev/Laya routing controller](docs/routing-controller.md)
 
-**Status:** early software, not a production-capacity guarantee. TLS 1.2/1.3 only; no TLS 1.0/1.1, HTTP/2/3, OCSP stapling, embedded ACME client or dynamic plugin loader. HTTP hooks act on headers, not WebSocket payloads. CI builds and runs Linux AMD64/ARM64 binaries and containers on native runners. A Kubernetes resource controller is separate work.
+**Status:** early software, not a production-capacity guarantee. TLS 1.2/1.3 only; no TLS 1.0/1.1, HTTP/2/3, OCSP stapling, embedded ACME client or dynamic plugin loader. HTTP hooks act on headers, not WebSocket payloads. CI builds and runs Linux AMD64/ARM64 binaries and containers on native runners. Ingress reconciliation is namespace-scoped; Gateway API and Ingress status publication are not implemented.
 
 Licensed under [GPLv3](LICENSE). Inspired by Balance's CLI and routing model; the original C implementation is not included.

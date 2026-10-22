@@ -13,6 +13,7 @@ use crate::Error;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub ingress: Option<crate::ingress::Settings>,
     pub listen: SocketAddr,
     pub backends: Vec<Backend>,
     pub workers: usize,
@@ -48,6 +49,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            ingress: None,
             listen: "127.0.0.1:8080".parse().unwrap(),
             backends: vec![],
             workers: 2,
@@ -191,6 +193,20 @@ impl Config {
 
     // Called by load and positional CLI parsing; reject inconsistent settings before use.
     pub fn validate(&self) -> Result<(), Error> {
+        if let Some(ingress) = &self.ingress {
+            ingress.validate()?;
+            if self.http1.is_none()
+                || self.tls.is_none()
+                || !self.backends.is_empty()
+                || !self.routing_constraints.is_empty()
+                || !self.hash_groups.is_empty()
+            {
+                return Err(
+                    "ingress requires TLS, http1, no static backends or decision/hash routing"
+                        .into(),
+                );
+            }
+        }
         if self.routing_constraints.len() > 128 {
             return Err("too many routing constraints".into());
         }
@@ -280,7 +296,7 @@ impl Config {
                 }
             }
         }
-        if !(1..=256).contains(&self.backends.len()) {
+        if self.ingress.is_none() && !(1..=256).contains(&self.backends.len()) {
             return Err("need 1..=256 backends".into());
         }
         if !(1..=256).contains(&self.workers) {
@@ -341,7 +357,7 @@ impl Config {
                 return Err("server_name is required exactly when upstream_tls is enabled".into());
             }
         }
-        if !self.backends.iter().any(|b| b.weight > 0) {
+        if self.ingress.is_none() && !self.backends.iter().any(|b| b.weight > 0) {
             return Err("at least one backend needs positive weight".into());
         }
         if self

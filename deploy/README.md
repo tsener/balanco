@@ -32,7 +32,7 @@ For a LAN-accessible single-node lab, follow the [k3s deployment recipe](k3s.md)
 
 `kubernetes/` contains a Kustomize deployment, LoadBalancer Service, ConfigMap and references to a separately supplied TLS Secret. It runs two pods, each limited to two CPUs, as a non-root user with read-only configuration and certificate mounts. Only the image-owned `/run/balanco` directory is writable by that user. The container layer remains writable so the socket directory resets on container restart; a persistent `emptyDir` would retain an uncleanly terminated process's socket, which Balanco deliberately refuses to unlink. No Kubernetes API access or cluster-wide RBAC is required. The configuration is TCP/mTLS forwarding, which also tunnels WebSocket connections; add `http1` configuration for header transformations.
 
-This is a **manually configured edge proxy**, not a Kubernetes Ingress controller. It does not watch Ingress, Gateway API, EndpointSlice, Service or Secret resources. No `IngressClass` is registered. A controller that validates resources, resolves endpoints and publishes configuration is separate implementation work. Packaging the proxy as an image does not add that reconciliation behaviour.
+The base `kubernetes/` bundle is a **manually configured edge proxy**. To watch Ingress, Service, EndpointSlice and TLS Secret resources instead, use the [Ingress controller bundle](ingress.md), which requires a build after v0.1.1. Gateway API resources are not reconciled.
 
 Before deployment:
 

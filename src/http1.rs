@@ -14,7 +14,7 @@ use std::{
     io,
     pin::Pin,
     sync::{
-        Arc, OnceLock, RwLock,
+        Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     task::{Context as TaskContext, Poll},
@@ -22,7 +22,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, mpsc, oneshot},
     time::{Instant, timeout},
 };
 
@@ -268,7 +268,7 @@ struct Traffic {
     last_ms: AtomicU64,
     up: AtomicU64,
     down: AtomicU64,
-    counters: OnceLock<Arc<Counters>>,
+    counters: RwLock<Option<Arc<Counters>>>,
 }
 impl Traffic {
     fn touch(&self) {
@@ -319,7 +319,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Metered<S> {
 }
 
 // Trailer fields must not bypass a header removal or inject a second trusted identity.
-struct Payload(Incoming);
+struct Payload(Option<Incoming>);
 impl Body for Payload {
     type Data = Bytes;
     type Error = hyper::Error;
@@ -328,17 +328,22 @@ impl Body for Payload {
         cx: &mut TaskContext<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
         loop {
-            match Pin::new(&mut self.0).poll_frame(cx) {
+            let Some(body) = self.0.as_mut() else {
+                return Poll::Ready(None);
+            };
+            match Pin::new(body).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => continue,
                 other => return other,
             }
         }
     }
     fn is_end_stream(&self) -> bool {
-        self.0.is_end_stream()
+        self.0.as_ref().is_none_or(Body::is_end_stream)
     }
     fn size_hint(&self) -> SizeHint {
-        self.0.size_hint()
+        self.0
+            .as_ref()
+            .map_or(SizeHint::with_exact(0), Body::size_hint)
     }
 }
 impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
@@ -358,7 +363,13 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
                 &self.traffic.down
             };
             local.fetch_add(n as u64, Ordering::Relaxed);
-            if let Some(counters) = self.traffic.counters.get() {
+            if let Some(counters) = self
+                .traffic
+                .counters
+                .read()
+                .expect("traffic lock poisoned")
+                .as_ref()
+            {
                 let total = if self.upstream {
                     &counters.up
                 } else {
@@ -378,21 +389,24 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
 }
 
 // Called by Proxy::relay; parse the first headers before establishing an upstream, then stream bodies.
-pub async fn relay<A, F, Fut>(
+pub async fn relay<A, F, Fut, R>(
     client: A,
     connection: crate::ClientInfo,
     config: &crate::config::Config,
     state: Arc<State>,
-    establish: F,
+    reusable: R,
+    mut establish: F,
 ) -> Result<(u64, u64), Error>
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: FnOnce(crate::decision::HttpMetadata) -> Fut,
+    F: FnMut(crate::decision::HttpMetadata) -> Fut,
+    R: Fn(&crate::decision::HttpMetadata, &crate::config::Backend) -> bool + Clone,
     Fut: std::future::Future<Output = Result<(crate::Upstream, crate::scheduler::Lease), Error>>,
 {
     let idle_ms = config.idle_timeout_ms;
     let buffer = config.buffer_bytes;
     let packet_dump = config.packet_dump;
+    let ingress = config.ingress.is_some();
     let config = config
         .http1
         .clone()
@@ -403,7 +417,7 @@ where
         last_ms: AtomicU64::new(0),
         up: AtomicU64::new(0),
         down: AtomicU64::new(0),
-        counters: OnceLock::new(),
+        counters: RwLock::new(None),
     });
     let client = TokioIo::new(Metered {
         stream: client,
@@ -414,34 +428,42 @@ where
     let max_header_bytes = config.max_header_bytes;
     let header_timeout = Duration::from_millis(config.header_timeout_ms);
     let run = async {
-        let (metadata_tx, metadata_rx) = oneshot::channel();
-        let (sender_tx, sender_rx) = oneshot::channel();
-        let routing = Arc::new(Mutex::new((Some(metadata_tx), Some(sender_rx))));
+        let (routing, mut requests) = mpsc::channel::<(_, oneshot::Sender<Result<_, Error>>)>(1);
         let upstream_traffic = traffic.clone();
         let upstream_config = config.clone();
         let upstream = async move {
-            let metadata = match metadata_rx.await {
-                Ok(m) => m,
-                Err(_) => return Ok(None),
-            };
-            let (backend, lease) = establish(metadata).await?;
-            let _ = upstream_traffic.counters.set(lease.counters.clone());
-            let backend = TokioIo::new(Metered {
-                stream: backend,
-                traffic: upstream_traffic,
-                upstream: true,
-                dump: packet_dump.then_some("backend->client"),
-            });
-            let (sender, driver) = hyper::client::conn::http1::Builder::new()
-                .max_headers(64)
-                .max_buf_size(upstream_config.max_header_bytes)
-                .handshake::<_, Payload>(backend)
-                .await?;
-            sender_tx
-                .send((sender, lease))
-                .map_err(|_| "HTTP frontend closed before backend setup")?;
-            driver.with_upgrades().await?;
-            Ok::<_, Error>(None::<()>)
+            while let Some((metadata, sender_tx)) = requests.recv().await {
+                let (backend, lease) = match establish(metadata).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sender_tx.send(Err(error));
+                        continue;
+                    }
+                };
+                *upstream_traffic
+                    .counters
+                    .write()
+                    .expect("traffic lock poisoned") = Some(lease.counters.clone());
+                let backend = TokioIo::new(Metered {
+                    stream: backend,
+                    traffic: upstream_traffic.clone(),
+                    upstream: true,
+                    dump: packet_dump.then_some("backend->client"),
+                });
+                let (sender, driver) = hyper::client::conn::http1::Builder::new()
+                    .max_headers(64)
+                    .max_buf_size(upstream_config.max_header_bytes)
+                    .handshake::<_, Payload>(backend)
+                    .await?;
+                sender_tx
+                    .send(Ok((sender, lease)))
+                    .map_err(|_| "HTTP frontend closed before backend setup")?;
+                let result = driver.with_upgrades().await;
+                if !ingress {
+                    result?;
+                }
+            }
+            Ok::<_, Error>(())
         };
         let sender = Arc::new(Mutex::new(None));
         let retained_lease = Arc::new(Mutex::new(None));
@@ -456,6 +478,7 @@ where
             let upgrade_tx = upgrade_tx.clone();
             let sni = connection.sni.clone();
             let config = config.clone();
+            let reusable = reusable.clone();
             let mut routing_info = connection.clone();
             async move {
                 let result = async {
@@ -490,15 +513,34 @@ where
                     let metadata = metadata(&request, ws)?;
                     routing_info.metadata.http = Some(metadata.clone());
                     let mut sender = sender.lock().await;
+                    let reroute = ingress
+                        && (retained_lease.lock().await.as_ref().is_some_and(
+                            |lease: &crate::scheduler::Lease| !reusable(&metadata, &lease.backend),
+                        ) || sender
+                            .as_ref()
+                            .is_some_and(hyper::client::conn::http1::SendRequest::is_closed));
+                    if reroute {
+                        // Reuse only while this request still maps to the ready backend; WebSockets retain their lease.
+                        *sender = None;
+                        *retained_lease.lock().await = None;
+                    }
                     if sender.is_none() {
-                        let mut init = routing.lock().await;
-                        init.0
-                            .take()
-                            .ok_or("missing HTTP routing request")?
-                            .send(metadata)
+                        let (tx, rx) = oneshot::channel();
+                        routing
+                            .send((metadata, tx))
+                            .await
                             .map_err(|_| "backend setup closed")?;
-                        let (ready, lease) =
-                            init.1.take().ok_or("missing backend setup result")?.await?;
+                        let (ready, lease) = rx.await?.map_err(|error| {
+                            if ingress
+                                && error
+                                    .downcast_ref::<crate::ingress::RoutingError>()
+                                    .is_none()
+                            {
+                                Box::new(crate::ingress::RoutingError(503)) as Error
+                            } else {
+                                error
+                            }
+                        })?;
                         *retained_lease.lock().await = Some(lease);
                         *sender = Some(ready);
                     }
@@ -549,7 +591,9 @@ where
                     let mut response =
                         timeout(Duration::from_millis(config.response_timeout_ms), async {
                             sender.ready().await?;
-                            sender.send_request(request.map(Payload)).await
+                            sender
+                                .send_request(request.map(|body| Payload(Some(body))))
+                                .await
                         })
                         .await??;
                     let switching = response.status() == hyper::StatusCode::SWITCHING_PROTOCOLS;
@@ -604,10 +648,23 @@ where
                             ))
                             .map_err(|_| "HTTP upgrade receiver closed")?;
                     }
-                    Ok(response.map(Payload))
+                    Ok(response.map(|body| Payload(Some(body))))
                 }
                 .await;
-                result.map_err(io::Error::other)
+                match result {
+                    Err(error) if ingress => {
+                        let code = error
+                            .downcast_ref::<crate::ingress::RoutingError>()
+                            .map_or(400, |e| e.0);
+                        Ok(hyper::Response::builder()
+                            .status(code)
+                            .header("content-length", "0")
+                            .header("connection", "close")
+                            .body(Payload(None))
+                            .expect("fixed error response"))
+                    }
+                    result => result.map_err(io::Error::other),
+                }
             }
         });
         let mut builder = hyper::server::conn::http1::Builder::new();
@@ -681,6 +738,7 @@ mod tests {
             pool.routing(&Operation::Apply(policy)).unwrap();
             let tls = Arc::new(crate::tls::Tls::load(&config).unwrap());
             let proxy = Proxy {
+                ingress: None,
                 pool: pool.clone(),
                 http: Arc::new(State::new(config.http1.clone(), vec![])),
                 stats: Default::default(),

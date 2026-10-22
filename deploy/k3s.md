@@ -2,8 +2,9 @@
 
 This recipe runs Balanco at a Linux node's LAN address on port 443. It uses the
 same [Kustomize bundle](kubernetes/) as other Kubernetes deployments. Balanco
-terminates device mTLS and forwards to a Service; it does not reconcile Kubernetes
-`Ingress` or Gateway API resources. Start with a dedicated lab VM. Two replicas
+terminates device mTLS and forwards to a Service in manually configured mode.
+For Kubernetes `Ingress` reconciliation, use the [Ingress bundle](ingress.md) on
+the same k3s cluster instead. Start with a dedicated lab VM. Two replicas
 request four CPUs in total; allow additional capacity for Kubernetes, workloads
 and rolling updates. Two replicas on one node do not provide node failure tolerance.
 
