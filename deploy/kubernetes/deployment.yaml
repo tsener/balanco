@@ -31,10 +31,15 @@ spec:
           type: RuntimeDefault
       containers:
         - name: balanco
-          # Replace with a verified release image digest before deployment.
-          image: ghcr.io/tsener/balanco:main
+          # v0.1.1 image index: Linux AMD64 and ARM64.
+          image: ghcr.io/tsener/balanco@sha256:bc7f1962fc54c5b155b37e7dd8a4cb4949efa1adc177cf39dd714c0b2a918331
           imagePullPolicy: Always
           args: ["--config", "/etc/balanco/config/balanco.json"]
+          lifecycle:
+            preStop:
+              # Keep accepting while endpoint removal propagates; no shell needed.
+              sleep:
+                seconds: 5
           securityContext:
             allowPrivilegeEscalation: false
             # The image-owned socket directory resets on container restart.

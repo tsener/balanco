@@ -28,6 +28,8 @@ Buildx needs native workers or configured emulation for each requested platform;
 
 ## Kubernetes gateway bundle
 
+For a LAN-accessible single-node lab, follow the [k3s deployment recipe](k3s.md).
+
 `kubernetes/` contains a Kustomize deployment, LoadBalancer Service, ConfigMap and references to a separately supplied TLS Secret. It runs two pods, each limited to two CPUs, as a non-root user with read-only configuration and certificate mounts. Only the image-owned `/run/balanco` directory is writable by that user. The container layer remains writable so the socket directory resets on container restart; a persistent `emptyDir` would retain an uncleanly terminated process's socket, which Balanco deliberately refuses to unlink. No Kubernetes API access or cluster-wide RBAC is required. The configuration is TCP/mTLS forwarding, which also tunnels WebSocket connections; add `http1` configuration for header transformations.
 
 This is a **manually configured edge proxy**, not a Kubernetes Ingress controller. It does not watch Ingress, Gateway API, EndpointSlice, Service or Secret resources. No `IngressClass` is registered. A controller that validates resources, resolves endpoints and publishes configuration is separate implementation work. Packaging the proxy as an image does not add that reconciliation behaviour.
@@ -35,7 +37,7 @@ This is a **manually configured edge proxy**, not a Kubernetes Ingress controlle
 Before deployment:
 
 1. Replace the documentation-only backend `192.0.2.10:9000` in `kubernetes/balanco.json` with your backend Service's numeric ClusterIP and port. Balanco does not resolve JSON backend DNS names or track pod churn. A ClusterIP delegates pod selection to Kubernetes; choose separate regional Services to retain regional placement controls.
-2. Set `deployment.yaml` to a verified multi-architecture image tag/index digest. `main` is a development convenience, not a reproducible deployment pin. The base bundle supports Linux AMD64 and ARM64 nodes; for Graviton-only placement use the overlay below.
+2. Review the release image index pinned in `deployment.yaml` (v0.1.1), updating it deliberately when upgrading. The base bundle supports Linux AMD64 and ARM64 nodes; for Graviton-only placement use the overlay below.
 3. Provide a server certificate/full chain, private key and device client CA as a Secret. Keep the key outside this repository.
 
 ```sh
@@ -51,7 +53,7 @@ kubectl -n balanco rollout status deployment/balanco
 
 The cloud provider must support LoadBalancer Services; for EKS, configure your AWS Load Balancer Controller and NLB **TCP pass-through** so Balanco receives the TLS handshake. Do not terminate TLS at the NLB if Balanco is to verify device certificates. Configure provider-specific annotations and source-IP preservation for your target mode; `externalTrafficPolicy: Local` alone does not guarantee an original client IP through every cloud load balancer. Balanco does not consume inbound PROXY protocol. Management is deliberately not exposed by this example.
 
-Readiness checks the local administration socket, not an unauthenticated TLS probe. It establishes process/control-loop readiness, not backend availability. There is no aggressive liveness probe that would restart a busy proxy during a reconnect storm. The 45-second termination budget exceeds the default 30-second drain window; connections still open at the deadline are closed. Clients must reconnect with jitter. Kubernetes scheduling and networking still determine capacity; two CPUs is a resource budget, not a throughput guarantee.
+Readiness checks the local administration socket, not an unauthenticated TLS probe. It establishes process/control-loop readiness, not backend availability. There is no aggressive liveness probe that would restart a busy proxy during a reconnect storm. A five-second kubelet `preStop.sleep` lets endpoint removal propagate before Balanco stops accepting. The 45-second termination budget includes that pause and the default 30-second drain window; connections still open at the deadline are closed. Clients must reconnect with jitter. The bundle requires a cluster with `PodLifecycleSleepAction` enabled. Kubernetes scheduling and networking still determine capacity; two CPUs is a resource budget, not a throughput guarantee.
 
 For config changes, Kustomize's content hash updates the pod template and triggers a rolling deployment. Mounted Secret updates alone do **not** trigger Balanco reloads. After renewing a Secret, wait for projection and signal HUP using an approved supervisor, or explicitly run `kubectl -n balanco rollout restart deployment/balanco`. The rollout option closes remaining long-lived connections at the drain deadline. Avoid `subPath` certificate mounts because those do not receive Secret updates. For cert-manager, project its server Secret and your separate device CA appropriately; cert-manager does not enroll device identities for Balanco.
 

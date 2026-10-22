@@ -52,7 +52,7 @@ Supply your configuration with `./balanco --config /absolute/path/balanco.json`.
 
 ### Build from source
 
-Container builds, GHCR publishing and a Kubernetes gateway bundle are described in the [deployment guide](deploy/README.md).
+Container builds, GHCR publishing and a Kubernetes gateway bundle are described in the [deployment guide](deploy/README.md). For a local cluster, use the [k3s walkthrough](deploy/k3s.md).
 
 Linux or macOS; Rust 1.90+, a C compiler and CMake for AWS-LC. On Debian/Ubuntu, install `build-essential cmake` first.
 
