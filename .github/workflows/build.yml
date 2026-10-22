@@ -97,10 +97,26 @@ jobs:
           retention-days: 14
 
   container:
-    name: Static Linux image and binaries
+    name: Static Linux ${{ matrix.arch }} image and binaries
     needs: [linux, sonarqube]
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            machine: x86_64
+            elf_machine: Advanced Micro Devices X86-64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            machine: aarch64
+            elf_machine: AArch64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    env:
+      ARCH: ${{ matrix.arch }}
+      MACHINE: ${{ matrix.machine }}
+      ELF_MACHINE: ${{ matrix.elf_machine }}
     permissions:
       contents: read
       packages: write
@@ -117,18 +133,28 @@ jobs:
               version = tomllib.load(source)['package']['version']
           assert os.environ['GITHUB_REF_NAME'] == 'v' + version, 'Tag must match Cargo.toml version'
           PY
+      - name: Verify native runner
+        run: test "$(uname -m)" = "$MACHINE"
+      - name: ARM64 native unit checks
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential cmake openssl
+          rustup toolchain install 1.90.0 --profile minimal
+          cargo +1.90.0 test --locked --all-targets
       - name: Build static image
         run: |
-          docker build --platform linux/amd64 --file deploy/container/Dockerfile \
+          docker build --platform "linux/$ARCH" --file deploy/container/Dockerfile \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --tag balanco:build .
       - name: Render Kubernetes bundle
         run: |
-          curl -fsSLo /tmp/kubectl https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl
-          curl -fsSLo /tmp/kubectl.sha256 https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl.sha256
+          curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/v1.35.0/bin/linux/$ARCH/kubectl"
+          curl -fsSLo /tmp/kubectl.sha256 "https://dl.k8s.io/release/v1.35.0/bin/linux/$ARCH/kubectl.sha256"
           echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum --check
           chmod 0755 /tmp/kubectl
           /tmp/kubectl kustomize deploy/kubernetes > /tmp/balanco-kubernetes.yaml
+          /tmp/kubectl kustomize deploy/kubernetes-graviton > /tmp/balanco-graviton.yaml
       - name: Verify image and package binaries
         run: |
           command -v readelf
@@ -161,6 +187,8 @@ jobs:
           docker cp "$container_id:/bin/balanco-controller" package/balanco-controller
           cp LICENSE package/
           for binary in package/balanco package/balanco-controller; do
+            readelf -h "$binary" > /tmp/balanco-elf-header
+            grep -q "Machine:.*$ELF_MACHINE" /tmp/balanco-elf-header
             readelf -l "$binary" > /tmp/balanco-program-headers
             readelf -d "$binary" > /tmp/balanco-dynamic-section
             if grep -q interpreter /tmp/balanco-program-headers; then exit 1; fi
@@ -168,12 +196,13 @@ jobs:
           done
           package/balanco --version
           package/balanco --config examples/http1.json --check
-          tar -czf static-dist/balanco-linux-amd64-musl.tar.gz -C package balanco balanco-controller LICENSE
-          git archive --format=tar.gz --output=static-dist/balanco-source.tar.gz HEAD
-          (cd static-dist && sha256sum *.tar.gz > SHA256SUMS)
+          tar -czf "static-dist/balanco-linux-$ARCH-musl.tar.gz" -C package balanco balanco-controller LICENSE
+          if [ "$ARCH" = amd64 ]; then
+            git archive --format=tar.gz --output=static-dist/balanco-source.tar.gz HEAD
+          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: balanco-static-linux-amd64-${{ github.sha }}
+          name: balanco-static-linux-${{ matrix.arch }}-${{ github.sha }}
           path: static-dist/
           if-no-files-found: error
           retention-days: 14
@@ -185,22 +214,65 @@ jobs:
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           trap 'docker logout ghcr.io >/dev/null' EXIT
-          docker tag balanco:build "$image:sha-$GITHUB_SHA"
-          docker push "$image:sha-$GITHUB_SHA"
-          docker tag balanco:build "$image:$GITHUB_REF_NAME"
-          docker push "$image:$GITHUB_REF_NAME"
+          docker tag balanco:build "$image:sha-$GITHUB_SHA-$ARCH"
+          docker push "$image:sha-$GITHUB_SHA-$ARCH"
+
+  publish:
+    name: Multi-architecture image and release assets
+    needs: [container]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: balanco-static-linux-*-${{ github.sha }}
+          merge-multiple: true
+          path: static-dist
+      - name: Generate combined checksums
+        run: |
+          test -s static-dist/balanco-linux-amd64-musl.tar.gz
+          test -s static-dist/balanco-linux-arm64-musl.tar.gz
+          test -s static-dist/balanco-source.tar.gz
+          (cd static-dist && sha256sum *.tar.gz > SHA256SUMS && sha256sum --check SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: balanco-release-${{ github.sha }}
+          path: static-dist/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish and inspect multi-architecture tags
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null' EXIT
+          for tag in "sha-$GITHUB_SHA" "$GITHUB_REF_NAME"; do
+            docker manifest create "$image:$tag" "$image:sha-$GITHUB_SHA-amd64" "$image:sha-$GITHUB_SHA-arm64"
+            docker manifest push "$image:$tag"
+          done
+          docker manifest inspect "$image:sha-$GITHUB_SHA" > /tmp/balanco-manifest.json
+          python3 - <<'PY'
+          import json
+          with open('/tmp/balanco-manifest.json') as source:
+              platforms = {(m['platform']['os'], m['platform']['architecture']) for m in json.load(source)['manifests']}
+          assert platforms == {('linux', 'amd64'), ('linux', 'arm64')}, platforms
+          PY
 
   release:
     name: Draft GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [container]
+    needs: [publish]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: balanco-static-linux-amd64-${{ github.sha }}
+          name: balanco-release-${{ github.sha }}
           path: static-dist
       - name: Create draft with binaries, source and checksums
         env:
@@ -209,4 +281,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" static-dist/* --verify-tag --draft \
             --title "Balanco $GITHUB_REF_NAME" \
-            --notes 'Static Linux x86-64 binaries, corresponding source, and SHA-256 checksums. Review the deployment guide before use. Container image: ghcr.io/tsener/balanco.'
+            --notes 'Static Linux AMD64 and ARM64 binaries, corresponding source, and SHA-256 checksums. Multi-architecture container: ghcr.io/tsener/balanco. See the deployment guide for Graviton/EKS configuration.'

@@ -2,12 +2,12 @@
 
 ## Distribution
 
-Use [GitHub Container Registry (GHCR)](https://github.com/tsener/balanco/pkgs/container/balanco) for the OCI/Docker image and [GitHub Releases](https://github.com/tsener/balanco/releases) for downloadable binaries. Neither needs Docker Hub credentials. The Build workflow validates the image on pull requests, publishes `ghcr.io/tsener/balanco:main` plus a commit-specific `sha-COMMIT` tag after main checks pass, and publishes version tags on `v*` tag builds. Pin deployments by image digest for immutability. Binary archives, corresponding source and SHA-256 checksums are attached to a draft GitHub Release; review it before publishing. The first release tag should match `Cargo.toml`, currently `v0.1.0`.
+Use [GitHub Container Registry (GHCR)](https://github.com/tsener/balanco/pkgs/container/balanco) for the OCI/Docker image and [GitHub Releases](https://github.com/tsener/balanco/releases) for downloadable binaries. Neither needs Docker Hub credentials. The Build workflow validates both architectures on pull requests, publishes multi-architecture `ghcr.io/tsener/balanco:main` and commit-specific `sha-COMMIT` tags after main checks pass, and publishes version tags on `v*` tag builds. Pin deployments by image-index digest for immutability across architectures. Binary archives, corresponding source and combined SHA-256 checksums are attached to a draft GitHub Release; review it before publishing. The release tag must match `Cargo.toml`, currently `v0.1.1`.
 
-The first release target is Linux x86-64. The image uses a musl build and a scratch runtime with statically linked `balanco` and `balanco-controller`. No shell, Rust runtime, OpenSSL shared library or DNS-provider credentials are included. Certificate/trust files and optional GeoIP data are supplied at deployment. Static ELF checks run during image creation and CI executes the binary outside the image too. ARM64/macOS release builds are not included yet.
+Release targets are Linux AMD64 (`x86_64-unknown-linux-musl`) and ARM64 (`aarch64-unknown-linux-musl`, suitable for Graviton). Each image uses a musl build and a scratch runtime with statically linked `balanco` and `balanco-controller`. No shell, Rust runtime, OpenSSL shared library or DNS-provider credentials are included. Certificate/trust files and optional GeoIP data are supplied at deployment. CI runs unit checks on native AMD64/ARM64 runners, checks each executable's ELF architecture/static linkage, starts the containers and probes local administration before composing a shared manifest. Native macOS release builds are not included.
 
 ```sh
-docker build --platform linux/amd64 -f deploy/container/Dockerfile -t balanco:local .
+docker build -f deploy/container/Dockerfile -t balanco:local .
 docker run --rm balanco:local --version
 docker run --rm --read-only --cap-drop ALL \
   --tmpfs /run/balanco:uid=65532,gid=65532,mode=0700 \
@@ -17,7 +17,14 @@ docker run --rm --read-only --cap-drop ALL \
 
 Use a config listening on `0.0.0.0:8443` with `control_socket` under `/run/balanco`; mount its certificate paths read-only and make the keys readable by UID/GID 65532. The controller is available with `--entrypoint /bin/balanco-controller`. Application payloads are decrypted in this process; don't enable packet dumping in a deployment.
 
-For manual publication, use `docker login ghcr.io`, tag the tested image for your account, and `docker push`. In GitHub Actions, the repository's `GITHUB_TOKEN` provides package write access. After the first push, check the package visibility in GitHub: a public source repository does not automatically make a newly created package public. Docker Hub is an optional second destination requiring its own account/token. Source for the built components is included at `/usr/share/balanco/source.tar.gz` in the image; release assets also contain a repository source archive.
+The local build targets the builder's architecture. For manual multi-architecture publication, use `docker login ghcr.io` and a Buildx builder configured for both platforms:
+
+```sh
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -f deploy/container/Dockerfile -t ghcr.io/YOUR_ACCOUNT/balanco:VERSION --push .
+```
+
+Buildx needs native workers or configured emulation for each requested platform; the project CI uses native runners. In GitHub Actions, the repository's `GITHUB_TOKEN` provides package write access. Architecture-specific intermediate tags use `sha-COMMIT-amd64` and `sha-COMMIT-arm64`; shared tags are published only after both pass. After the first push, check the package visibility in GitHub: a public source repository does not automatically make a newly created package public. Docker Hub is an optional second destination requiring its own account/token. Source for the built components is included at `/usr/share/balanco/source.tar.gz` in the image; release assets also contain a repository source archive.
 
 ## Kubernetes gateway bundle
 
@@ -28,7 +35,7 @@ This is a **manually configured edge proxy**, not a Kubernetes Ingress controlle
 Before deployment:
 
 1. Replace the documentation-only backend `192.0.2.10:9000` in `kubernetes/balanco.json` with your backend Service's numeric ClusterIP and port. Balanco does not resolve JSON backend DNS names or track pod churn. A ClusterIP delegates pod selection to Kubernetes; choose separate regional Services to retain regional placement controls.
-2. Set `deployment.yaml` to a verified image tag/digest. `main` is a development convenience, not a reproducible deployment pin. The current published architecture requires x86-64 nodes.
+2. Set `deployment.yaml` to a verified multi-architecture image tag/index digest. `main` is a development convenience, not a reproducible deployment pin. The base bundle supports Linux AMD64 and ARM64 nodes; for Graviton-only placement use the overlay below.
 3. Provide a server certificate/full chain, private key and device client CA as a Secret. Keep the key outside this repository.
 
 ```sh
@@ -48,13 +55,26 @@ Readiness checks the local administration socket, not an unauthenticated TLS pro
 
 For config changes, Kustomize's content hash updates the pod template and triggers a rolling deployment. Mounted Secret updates alone do **not** trigger Balanco reloads. After renewing a Secret, wait for projection and signal HUP using an approved supervisor, or explicitly run `kubectl -n balanco rollout restart deployment/balanco`. The rollout option closes remaining long-lived connections at the drain deadline. Avoid `subPath` certificate mounts because those do not receive Secret updates. For cert-manager, project its server Secret and your separate device CA appropriately; cert-manager does not enroll device identities for Balanco.
 
+## Graviton nodes
+
+Create your ARM64 EKS node group and backend/TLS configuration as above, then deploy the ARM64-only overlay:
+
+```sh
+kubectl kustomize deploy/kubernetes-graviton
+kubectl apply -k deploy/kubernetes-graviton
+kubectl -n balanco rollout status deployment/balanco
+kubectl -n balanco get pods -o wide
+```
+
+It adds `kubernetes.io/arch: arm64`; containerd selects the ARM64 child from the shared image tag. Pin an image **index** digest, not the AMD64 child digest. Tainted node groups also need matching tolerations supplied by your deployment. The image is built for baseline ARM64 compatibility, not a Graviton-specific CPU generation. Native ARM64 CI execution does not establish EKS/Graviton connection capacity; benchmark on your target instance before sizing production.
+
 ## Release checklist
 
 Review the main build and Sonar quality gate, update `Cargo.toml`/`Cargo.lock` if bumping the package version, then create a version tag:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
-The workflow builds that exact revision, publishes its image tags and creates a draft release containing `balanco-linux-amd64-musl.tar.gz`, `balanco-source.tar.gz` and `SHA256SUMS`. Verify the assets and publish the draft from GitHub. Tags are not created automatically. Existing release assets are not overwritten. Linux images and binaries still require a compatible host kernel.
+The workflow builds that exact revision, publishes its multi-architecture image tags and creates a draft release containing `balanco-linux-amd64-musl.tar.gz`, `balanco-linux-arm64-musl.tar.gz`, `balanco-source.tar.gz` and `SHA256SUMS`. The combined checksum file covers all three archives; use `sha256sum --check --ignore-missing SHA256SUMS` when downloading only one architecture and source. Verify the assets and publish the draft from GitHub. Tags are not created automatically. Existing release assets are not overwritten. Linux images and binaries still require a compatible host kernel.

@@ -24,30 +24,31 @@ Optional local GeoIP and first-request HTTP/WebSocket metadata steer regional ba
 
 ### Docker
 
-The image contains statically linked Linux AMD64 executables and runs as a non-root user:
+The multi-architecture image supports Linux AMD64 and ARM64, including AWS Graviton. Docker selects the matching image automatically. Both variants contain statically linked executables and run as a non-root user:
 
 ```sh
-docker pull ghcr.io/tsener/balanco:v0.1.0
-docker run --rm ghcr.io/tsener/balanco:v0.1.0 --version
+docker pull ghcr.io/tsener/balanco:v0.1.1
+docker run --rm ghcr.io/tsener/balanco:v0.1.1 --version
 ```
 
 To serve traffic, mount your configuration and certificates, provide a writable runtime directory, and publish the configured listener port. See the [container and Kubernetes deployment guide](deploy/README.md) for a complete example. Kubernetes Ingress resource reconciliation is not implemented.
 
 ### Linux binary
 
-Download [v0.1.0](https://github.com/tsener/balanco/releases/tag/v0.1.0) for Linux x86-64. The archive includes `balanco`, `balanco-controller` and the license; no Rust runtime or shared libraries are required. Download the corresponding source archive too, then verify both before extracting:
+Download [v0.1.1](https://github.com/tsener/balanco/releases/tag/v0.1.1) for Linux AMD64 or ARM64. Each archive includes `balanco`, `balanco-controller` and the license; no Rust runtime or shared libraries are required. Download the corresponding source archive too, then verify the downloaded archives before extracting (the other architecture is skipped):
 
 ```sh
-release_url=https://github.com/tsener/balanco/releases/download/v0.1.0
-curl -fLO "$release_url/balanco-linux-amd64-musl.tar.gz"
+arch=amd64 # Use arm64 for Graviton or other ARM64 Linux hosts.
+release_url=https://github.com/tsener/balanco/releases/download/v0.1.1
+curl -fLO "$release_url/balanco-linux-$arch-musl.tar.gz"
 curl -fLO "$release_url/balanco-source.tar.gz"
 curl -fLO "$release_url/SHA256SUMS"
-sha256sum --check SHA256SUMS && \
-  tar -xzf balanco-linux-amd64-musl.tar.gz && \
+sha256sum --check --ignore-missing SHA256SUMS && \
+  tar -xzf "balanco-linux-$arch-musl.tar.gz" && \
   ./balanco --version
 ```
 
-Supply your configuration with `./balanco --config /absolute/path/balanco.json`. Native macOS and ARM64 release binaries are not included.
+Supply your configuration with `./balanco --config /absolute/path/balanco.json`. Native macOS binaries are not included. For EKS Graviton node groups, use the [ARM64 Kubernetes overlay](deploy/README.md#graviton-nodes).
 
 ### Build from source
 
@@ -84,6 +85,6 @@ Start with [TCP](examples/tcp.json), [two-leg mTLS](examples/mtls.json), [HTTP h
 - [External weight decisions and routing API](docs/routing-api.md)
 - [Jev/Laya routing controller](docs/routing-controller.md)
 
-**Status:** early software, not a production-capacity guarantee. TLS 1.2/1.3 only; no TLS 1.0/1.1, HTTP/2/3, OCSP stapling, embedded ACME client or dynamic plugin loader. HTTP hooks act on headers, not WebSocket payloads. CI builds Linux x86-64 binaries and a static musl container; cross-architecture packaging and a Kubernetes resource controller are separate work.
+**Status:** early software, not a production-capacity guarantee. TLS 1.2/1.3 only; no TLS 1.0/1.1, HTTP/2/3, OCSP stapling, embedded ACME client or dynamic plugin loader. HTTP hooks act on headers, not WebSocket payloads. CI builds and runs Linux AMD64/ARM64 binaries and containers on native runners. A Kubernetes resource controller is separate work.
 
 Licensed under [GPLv3](LICENSE). Inspired by Balance's CLI and routing model; the original C implementation is not included.
